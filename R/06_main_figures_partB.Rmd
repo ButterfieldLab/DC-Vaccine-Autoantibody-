@@ -1,0 +1,1509 @@
+---
+title: "2B_(AutoA)"
+output: html_document
+date: "2024-08-16"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Paths/libraries/source code
+```{r}
+# ---- Project setup: paths, packages, colours/themes ----------------------
+# Replaces the original machine-specific absolute paths and the two lost
+# source files (autoantibody_libraries.R, LHB_color_tools.R). setup.R defines
+# file_path, data_path, results_path and loads all packages + figure themes.
+if (file.exists("setup.R")) source("setup.R") else source(file.path("R", "setup.R"))
+```
+
+```{r}
+metadata_df <- read_xlsx(paste0(data_path,"cancer vaccine Clinical Metadata.xlsx"),  sheet = 1)
+raw_df <- read_csv(paste0(data_path,"REAP_cancer_vaccine_butterfield.csv"))
+annotation_df <- read_csv(paste0(data_path,"library_annotation.csv"))
+Phip_seq_rpk <- read_csv(paste0(data_path,"downloads_study310_mapped_rpk_gene.csv"))
+```
+
+
+```{r}
+subj_names <- colnames(Phip_seq_R3_rpk)
+df <- data.frame(strings = subj_names, stringsAsFactors = FALSE)
+
+# Split the "strings" column into "pt" and "day" columns where applicable
+df_Phip_metadata <- df %>%
+  mutate(pt_day = ifelse(str_detect(strings, "pt_"), strings, NA)) %>%
+  separate(pt_day, into = c("Subject_ID", "Vac_cycle"), sep = "_(?=day)", extra = "merge", fill = "right") %>% 
+  mutate(Subject_ID = str_replace(Subject_ID, "pt_", "PT_")) %>% 
+  mutate(Subject_ID = if_else(is.na(Subject_ID), strings, Subject_ID)) %>% 
+  mutate(Vac_cycle = if_else(is.na(Vac_cycle), "day_0", Vac_cycle))
+
+df_Phip_metadata %<>% 
+  dplyr::mutate_at(
+    vars(c(Subject_ID:Vac_cycle)), ~ if_else(is.na(.), 'HD', .)) %>% 
+  left_join(metadata, by = "Subject_ID")
+
+all(colnames(Phip_seq_R3_rpk) == df_Phip_metadata$strings)
+
+# fitler out all 0 rows
+keep <- rowSums(Phip_seq_R3_rpk[1:ncol(Phip_seq_R3_rpk)]) > 0
+filtered_R3_rpk <- Phip_seq_R3_rpk[keep,]
+# take last few columns with what I believe are some control enrichment samples ...
+filtered_R3_rpk <- filtered_R3_rpk[,1:139]
+
+filtered_R3_rpk$Protein <- rownames(filtered_Phip_seq_R3_rpk)
+
+filt_R3_rpk_long <- filtered_R3_rpk %>% gather(key = "Sample", value = "Expression", 
+                               names(filtered_R3_rpk[, !names(filtered_R3_rpk) %in% "Protein"]))
+
+filt_R3_rpk_long %>%  group_by(Sample) %>% 
+  summarise(sum = sum(Expression)) %>% pull(sum) %>% unique()
+```
+
+
+```{r}
+PHIPseq_list <- list()
+PHIPseq_list$df_Phip_metadata <- df_Phip_metadata # contains metadata with vac_cycle information 
+PHIPseq_list$Phip_seq_R3_rpk <- Phip_seq_R3_rpk # contains all rpk values 
+PHIPseq_list$filtered_R3_rpk <- filtered_R3_rpk # contaised 0 count removed rpk values 
+PHIPseq_list$filt_R3_rpk_long <- filt_R3_rpk_long # contains long (tidied) version of the filtered_R3_rpk
+
+PHIPseq_list %>% saveRDS(paste0(data_path, "PHIPseq_list.Rda"))
+```
+
+
+
+```{r}
+filt_Phip_rpk_long$log_express <- log(filt_Phip_rpk_long$Expression)
+
+filt_Phip_rpk_long$Sample %>% unique()
+beforeFiltering_plot <- filt_Phip_rpk_long %>%  
+  filter(grepl("pt_", Sample)) %>%
+    dplyr::filter(is.finite(log_express)) %>% 
+
+  ggplot(aes(x = log_express, colour = Sample)) +
+  geom_density() + 
+  #guides(colour = FALSE) +
+  ggtitle("A. Before filtering", subtitle = paste0(nrow(filt_Phip_rpk_long), " genes")) +
+  labs(x = "logCPM", y = "Density") +theme(legend.position="none")
+
+keepTheseGenes <- rowSums(Phip_seq_R3_rpk[1:ncol(Phip_seq_R3_rpk)]) > 100
+Phip_seq_R3_rpk
+
+afterFiltering_plot <-filt_Phip_rpk_long %>%  
+ filter(grepl("pt_", Sample)) %>%
+    dplyr::filter(is.finite(log_express)) %>% 
+  magrittr::extract(keepTheseGenes,) %>%
+  ggplot(aes(x = log_express, colour = Sample)) +
+  geom_density() + 
+  guides(colour = FALSE) +
+  ggtitle("B. After filtering", subtitle = paste0(table(keepTheseGenes)[[2]], " genes"))+
+  labs(x = "logCPM", y = "Density") +theme(legend.position="none")
+
+cowplot::plot_grid(beforeFiltering_plot, afterFiltering_plot)
+afterFiltering_plot
+```
+
+
+```{r}
+volcano_plot <- allDEresults %>%
+  ggplot(aes(x = logFC, 
+             y = -log10(P.Value),
+             colour = isSignificant)) +
+  geom_point(size = 1, alpha = 0.5) +
+  scale_colour_manual(values = c("grey", "red")) +
+  ggtitle("Differential gene expression results")
+
+volcano_plot
+anno <- rownames(allDEresults)
+
+Glimma::glXYPlot(allDEresults$logFC,
+         -log10(allDEresults$P.Value),
+         xlab="logFC",
+         ylab="-log(raw p-value)",
+         status=as.numeric(allDEresults$adj.P.Val <= 0.05), anno = anno)
+
+```
+
+```{r}
+filt_Phip_rpk_long %>% 
+  filter(grepl("pt_1", Sample)) %>% 
+  dplyr::filter(Protein == "ZPR1") %>% 
+  left_join(df_Phip_metadata, by = c("Sample" = "strings")) %>% 
+  ggplot(aes(x = Vac_cycle, y = Expression)) +
+  geom_boxplot() +
+    geom_point(aes(col = Response)) +
+  theme(aspect.ratio = 1) +
+  ggtitle("Expression of CD177 gene")
+head(df_Phip_metadata)
+```
+
+
+
+
+# 2 phip seq
+```{r}
+### Reading in the raw phip seq data
+Phip_seq_rpk %>% dim()
+Phip_seq_rpk %>% names()
+
+Phip_seq_rpk <- as.data.frame(Phip_seq_rpk)
+rownames(Phip_seq_rpk) <- Phip_seq_rpk$gene
+Phip_seq_rpk$gene <- NULL
+
+Phip_seq_R3_rpk <- Phip_seq_rpk %>% select(matches("Round3Lysate"))
+Phip_seq_R3_rpk
+dim(Phip_seq_R3_rpk)
+
+keep <- rowSums(Phip_seq_R3_rpk[1:ncol(Phip_seq_R3_rpk)]) > 0
+Phip_seq_R3_rpk <- Phip_seq_R3_rpk[keep,]
+Phip_seq_R3_rpk <- Phip_seq_R3_rpk[,1:139]
+```
+
+```{r}
+head(Phip_seq_raw)
+z_sc_Phip_rpk <- scale(Phip_seq_R3_rpk)
+z_sc_Phip_rpk %>% class()
+df_z_sc_Phip_rpk <-  as.data.frame(z_sc_Phip_rpk)
+
+# Initialize an empty list to store row names
+row_names_list <- list()
+
+# Iterate over each column of the dataframe
+for (col_name in colnames(df_z_sc_Phip_rpk)) {
+  # Filter the dataframe based on the absolute value condition for the current column
+  filtered_data <- df_z_sc_Phip_rpk %>%
+    filter(abs(get(col_name)) > 0.25)
+  
+  # Extract the row names of the filtered data and store in the list
+  row_names_list[[col_name]] <- rownames(filtered_data)
+}
+
+# Optional: If you want to combine all row names into a single vector
+all_row_names <- unlist(row_names_list)
+hit_abs <- unique(unname(all_row_names))
+hit_abs %>% length()
+
+# Subset the dataframe using rownames in all_row_names
+sub_Phip_seq_R3_rpk <- Phip_seq_R3_rpk[rownames(Phip_seq_R3_rpk) %in% hit_abs, ]
+```
+
+### change column names
+```{r}
+string_names <- names(sub_Phip_seq_R3_rpk)
+
+my_strings <- ifelse(str_detect(my_strings, "HD"), 
+                            str_extract(my_strings, "HD\\d+"), 
+                            my_strings)
+names(sub_Phip_seq_R3_rpk) <- my_strings
+```
+
+
+```{r}
+library(RColorBrewer)
+extracted_string <- sub("_Round3Lysate_S.*", "", string_names)
+names(sub_Phip_seq_R3_rpk) <- extracted_string
+
+sampleDists <- dist(t(sub_Phip_seq_R3_rpk))
+
+colnames(t(sub_Phip_seq_R3_rpk))
+as.matrix( sampleDists )
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- vsd.HAKAT$Treatment
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap::pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+
+grep("NY",rownames(sub_Phip_seq_R3_rpk), ignore.case = FALSE, value = T)
+```
+# 3. PCA
+```{r}
+PC <-prcomp(na.omit(sub_Phip_seq_R3_rpk), center = TRUE, scale = TRUE)
+PC <- data.frame(PC$rotation)
+
+my_strings <- rownames(PC)
+my_strings <- ifelse(str_detect(my_strings, "HD"), 
+                            str_extract(my_strings, "HD\\d+"), 
+                            my_strings)
+
+df <- data.frame(strings = my_strings, stringsAsFactors = FALSE)
+
+# Split the "strings" column into "pt" and "day" columns where applicable
+df_Phip_metadata <- df %>%
+  mutate(pt_day = ifelse(str_detect(strings, "pt_"), strings, NA)) %>%
+  separate(pt_day, into = c("Subject_ID", "Vac_cycle"), sep = "_(?=day)", extra = "merge", fill = "right") %>% 
+  mutate(Subject_ID = str_replace(Subject_ID, "pt_", "PT_")) %>% 
+  mutate(Subject_ID = if_else(is.na(Subject_ID), strings, Subject_ID)) %>% 
+  mutate(Vac_cycle = if_else(is.na(Vac_cycle), "day_0", Vac_cycle))
+
+df_Phip_metadata %<>% 
+  dplyr::mutate_at(
+    vars(c(Subject_ID:Vac_cycle)), ~ if_else(is.na(.), 'HD', .)) %>% 
+  left_join(metadata, by = "Subject_ID")
+
+all(my_strings == df_Phip_metadata$strings)
+
+PC$Response <- df_Phip_metadata$Response
+PC$Vac_cycle <- df_Phip_metadata$Vac_cycle
+PC$Outcome <- df_Phip_metadata$Outcome
+
+# Theme Set Up
+########
+Theme.PCA <-  theme(legend.position="left", aspect.ratio = 1/1.25,
+          plot.title = element_text(size = 15, face = "bold"),
+        panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.text = element_text(size = 11, face ="bold"),
+  axis.text.y = element_text(face="plain", color="black",size=14),  # to label y-axis tics/number labels
+        axis.text.x = element_text(face="plain", color="black",size=14), 
+          axis.title.x = element_text(face="plain", color="black",size=14),
+        axis.title.y = element_text(face="plain", color="black",size=14),     
+  strip.background =element_blank())
+
+########
+
+ggplot(PC %>%  filter(Vac_cycle == "day_0"),aes(x=PC1,y=PC2, col = Outcome))+
+   geom_point(size=3,alpha=0.5) + theme_bw() +
+   #scale_color_manual(values = c(cols.R.assign))+ #your colors here
+   Theme.PCA
+```
+
+```{r}
+names(sub_Phip_seq_R3_rpk) == df_Phip_metadata$strings
+```
+
+
+
+```{r}
+### They did two experiments, one with 2 rounds of amplification and one with 3 rounds of amplification
+sub_Phip_seq_R3_rpk$gene <- rownames(sub_Phip_seq_R3_rpk)
+
+Phip_seq_intermediate_v1 <- sub_Phip_seq_R3_rpk %>%
+  pivot_longer(cols = -c(gene)) 
+
+Phip_seq_intermediate_v1 %<>%  left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+Phip_seq_final <- Phip_seq_intermediate_v1 %>%  rename(Protein = gene)
+
+library(vegan)
+Phip.seq.div <- Phip_seq_final %>%  #filter(Subject_ID == 'PT_1') 
+  filter(value  > 0 ) %>% 
+  select(Cancer,Vac_cycle, Response, Outcome, Outcome.1, Protein, value, Subject_ID,name) %>%
+  group_by(name) %>%
+  tidyr::nest() %>%
+  # Diversity
+  mutate(Shannon.Index = map(data, ~diversity(.$value, "shannon"))) %>% unnest(Shannon.Index) %>% 
+  mutate(Simpson.Index = map(data, ~diversity(.$value, "simpson"))) %>% unnest(Simpson.Index) %>% 
+  mutate(Invsimpson.Index = map(data, ~diversity(.$value, "invsimpson"))) %>% unnest(Invsimpson.Index) %>% 
+  # Observed Richness
+  mutate(Richness = map(data, ~specnumber(.$value, MARGIN = 1))) %>% unnest(Richness) %>% unnest(data) %>% ungroup()
+
+Phip.seq.div
+# Pielou's Evenness
+Phip.seq.div %<>% mutate(
+  Pielou_Evenness =  Shannon.Index/log(Richness),
+  Clonality =  1-Pielou_Evenness) 
+
+Phip.seq.div <- Phip.seq.div %>% select(-Pielou_Evenness,-value,-Protein) %>%
+   group_by(Cancer,Vac_cycle, Response, Outcome, Outcome.1, Subject_ID,name) %>% filter(row_number() == 1) %>% ungroup()
+glimpse(Phip.seq.div)
+
+hist(Phip.seq.div$Richness)
+
+ggplot(Phip.seq.div, aes(x = Vac_cycle, y=Richness, group = Subject_ID)) + 
+  geom_point() +
+  geom_line(aes(col = Outcome)) +
+  facet_wrap(~Outcome)
+```
+
+# colors
+```{r}
+cols.Response = c("magenta","red","green","lightblue","blue","grey45")
+cols.Response.assign <- setNames(cols.Response, levels(Phip_seq_final$Response))
+
+jitter_2 <- position_jitter(width = 0.25, height = 0)
+jitter_1 <- position_jitter(width = 0.1, height = 0)
+jitter_0 <- position_jitter(width = 0, height = 0)
+
+cols.Response = c("magenta","red","green","lightblue","blue","grey45")
+cols.Response.assign <- setNames(cols.Response, levels(Average_Frequencies$Response))
+
+cols.Outcome = c("magenta","red","grey45")
+cols.Outcome.assign <- setNames(cols.Outcome, levels(Average_Frequencies$Outcome))
+
+cols.Outcome.1 = c("magenta","red","green","grey45")
+cols.Outcome.1.assign <- setNames(cols.Outcome.1, levels(Average_Frequencies$Outcome.1))
+```
+
+```{r}
+Phip_seq_final %>%   
+  #select(Cancer, Vac_cycle, Response, Outcome, Outcome.1, Protein, value, Subject_ID, name) %>%
+  group_by(name) %>% 
+  tidyr::nest() %>%
+  # Calculate Diversity
+  mutate(Ab_quantile = map(data, ~ ntile(.x$value, 4))) %>% 
+  unnest(cols = c(Ab_quantile)) %>% 
+  unnest(cols = c(data)) %>% 
+  ungroup()
+
+Phip_seq_final$Response <- factor(Phip_seq_final$Response, levels=c("HD","PR","SD","NED1","NED2","PD"))
+Phip_seq_final$Outcome <- factor(Phip_seq_final$Outcome, levels=c("HD","Good","Bad"))
+Phip_seq_final$Outcome.1 <- factor(Phip_seq_final$Outcome.1, levels=c("HD","Good","Stable","Bad"))
+
+Phip_seq_final %>% arrange(desc(value))
+
+Phip_seq_final %<>%  
+  dplyr::mutate(Ab_quantile = ntile(value,3)) %>% relocate(Ab_quantile, .after = value)
+
+Phip_seq_final %>% 
+          filter(Ab_quantile == "1") %>% count()
+
+Phip_seq_final %>% filter(Vac_cycle == "day_0")  %>% 
+  group_by(Ab_quantile,Vac_cycle,Response, Outcome, name) %>% 
+  count() %>%  ggplot(aes(x = Response, y = n)) + 
+  geom_boxplot(aes(group=Response),outlier.colour = NA, col = "grey50", alpha = 0.7) +
+  geom_point(aes(col = Response)) +
+    scale_color_manual(values = c(cols.Response.assign))+
+  scale_fill_manual(values = c(cols.Response.assign)) +
+  facet_wrap(~Ab_quantile) 
+
+Phip_seq_final %>% filter(Outcome != "HD")  %>% 
+  group_by(Ab_quantile,Vac_cycle,Response, Outcome,Subject_ID, name) %>% 
+  count() %>%  
+ggplot(aes(x = Vac_cycle, y=n, group = Subject_ID)) + 
+  geom_point() +
+  geom_line(aes(col = Response)) +
+        facet_grid(. ~ Ab_quantile+Response, scales = "free", space = "free",
+                 #labeller = to_string
+                 )
+
+Phip_seq_final$Ab_quantile <- factor(
+Phip_seq_final$Ab_quantile, levels=c(
+  "3",
+  "2",
+  "1"))
+
+
+Phip_seq_final %>% # filter(PURO_quantile %in% c("1", "4")) %>% 
+  ggplot(aes(x = Ab_quantile, y = value)) +
+        geom_boxplot(aes(group=Ab_quantile),outlier.colour = NA, col = "grey50", alpha = 0.7) +
+  geom_jitter(position = jitter_1, shape=21,color="black",size = 2, alpha = 0.5,    aes(color=Cancer,fill=Cancer)) +
+  scale_color_manual(values = c(cols.Response.assign))+
+  scale_fill_manual(values = c(cols.Response.assign)) 
+
+
+names(Phip_seq_final)
+Phip_seq_median <- Phip_seq_final %>% 
+ group_by(Subject_ID,Cancer,Outcome,Response,Vac_cycle,Ab_quantile,name) %>% 
+  dplyr::summarise(across(where(is.numeric), ~ median(.x, na.rm = TRUE))) %>% ungroup()
+
+Phip_seq_median %>% 
+  filter(Vac_cycle == "day_0") %>% 
+ # mutate(Clasification = if_else(Clonotype_group %in% c("Small (Rare)","Medium"), "Polyclonal","Oligoclonal")) %>% 
+ggplot(aes(x = fct_reorder(Subject_ID,value), y = value, fill= Ab_quantile)) +
+  geom_col(position = "fill", color = "black", linewidth = 0.2) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values=alpha(c("tomato","khaki","lightblue","navy"), 1)) + 
+    labs(title = "Summary proportion of clonotypes with specific frequencies",
+      x = "Subject ID", 
+         y = "Relative abundance (%)", 
+         fill = "Clonotype group") +
+  theme_bw() + facet_wrap(~Cancer)
+      facet_grid(. ~ Sample_type+Visit, scales = "free", space = "free",
+                 labeller = to_string)+
+    theme(
+  legend.position = "right", 
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.text = element_text(size = 12, face ="bold", angle = 0),         
+  strip.background = element_blank(),
+  panel.border = element_rect(colour = "black", fill=NA, size=0.5), 
+  axis.text.x = element_blank(),
+  axis.text.y = element_text(face="plain", color="black",size=12),   
+  axis.title.x= element_text(face="plain", color="black",size=14),                            
+  axis.title.y= element_text(face="plain", color="black",size=16),     
+  axis.ticks.x  = element_blank(),
+  plot.title = element_text(size = 16))
+
+
+
+
+Phip_seq_median %>% # filter(PURO_quantile %in% c("1", "4")) %>% 
+  ggplot(aes(x = Ab_quantile, y = value)) +
+        geom_boxplot(aes(group=Ab_quantile),outlier.colour = NA, col = "grey50", alpha = 0.7) +
+  geom_jitter(position = jitter_2, shape=21,color="black",size = 2, alpha = 0.5,    aes(color=Ab_quantile,fill=Ab_quantile)) +
+  #geom_vline(xintercept = c(2.5),col="black", lwd = 0.5, linetype="dashed", alpha=1)+
+  #scale_color_manual(values = c(cols.Response.assign))+
+  #scale_fill_manual(values = c(cols.Response.assign)) +
+    # stat_pvalue_manual(Oligo_test_PDL1, label = "p", tip.length = 0,
+    #                  vjust = 0.01, y.position = 0.0565,
+    #                  size=3,
+    #                  hide.ns = FALSE)+
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.15))) +
+  theme_classic() 
+  facet_wrap(~Population, scales = "free_x", nrow = 1,
+             labeller = label_wrap_gen(width = 5, multi_line = TRUE)) +
+  ggtitle("PD-L1") +
+  theme(
+  legend.position = "right", aspect.ratio = 1/0.6,
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  strip.text = element_text(size = 9, face ="bold"),              # to label add individual box
+  strip.background =element_blank(), 
+  panel.border = element_rect(colour = NA, fill=NA, size=0.5),
+  # to color individual box
+  axis.text.x = element_text(face="plain", color="black",size=10),
+  # to label x-axis tics/number labels
+  axis.text.y = element_text(face="plain", color="black",size=10),  # to label y-axis tics/number labels
+  axis.title.x= element_blank(),                                    # to label/remove x-axis labels
+  axis.title.y= element_text(face="plain", color="black",size=10),    # to label/remove y-axis labels
+  axis.ticks.y = element_line(colour = "black", size = 1),
+  axis.ticks = element_blank())
+```
+
+
+# calculate mh Index
+```{r}
+
+sub_Phip_seq_R3_rpk <- sub_Phip_seq_R3_rpk[, !names(sub_Phip_seq_R3_rpk) %in% "gene"]
+sub_Phip_seq_R3_rpk
+
+PhipR_mh_result <- divo::mh(sub_Phip_seq_R3_rpk[, !names(sub_Phip_seq_R3_rpk) %in% "gene"], PlugIn = TRUE)
+
+Phip_mx_mat <- PhipR_mh_result$PlugIn
+Phip_mx_df <- as.data.frame(PhipR_mh_result$PlugIn)
+Phip_mx_df$name <- rownames(Phip_mx_df)
+
+Phip_mx_df %<>%  left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+
+Phip_mx_df
+
+library(circlize)
+library(grid)
+
+Response_anno = ComplexHeatmap::rowAnnotation(Response = Phip_mx_df$Response,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F,
+                        col = list(Response = c(colors_LHB$Response)))
+
+
+Subject_anno = ComplexHeatmap::columnAnnotation(Subject_ID = Phip_mx_df$Subject_ID,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F)
+                       # col = list(Subject_ID = c(cell_type_cols))
+                        
+
+Subject_anno_1 = ComplexHeatmap::rowAnnotation(Subject_ID = Phip_mx_df$Subject_ID,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F
+                        # col = list(Subject_ID = c(cell_type_cols))
+                    )
+
+
+ComplexHeatmap::Heatmap(Phip_mx_mat, 
+        cluster_columns  = T,  
+        cluster_rows  = F,
+        show_column_names = FALSE,
+        # column_split  = Phip_mx_df$Outcome.1,
+        row_split = Phip_mx_df$Outcome.1,
+        left_annotation = c(Response_anno,Subject_anno_1),
+          top_annotation = c(Subject_anno))
+
+
+Phip_mx_df_long <- Phip_mx_df %>%
+  pivot_longer(cols = -c(name)) 
+
+Phip_seq_intermediate_v1 %<>%  left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+Phip_seq_final <- Phip_seq_intermediate_v1 %>%  rename(Protein = gene)
+
+colnames(Phip_mx_mat)
+
+frame(PhipR_mh_result$PlugIn) %>% mutate(name = rownames(.)) 
+
+
+PhipR_mh_df_v2 %>%  pivot_longer(cols = -c(name)) 
+Phip_seq_intermediate_v1 %<>%  left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+```
+
+# Cosine_similarity_index
+```{r}
+library(lsa)
+Phip_cos_mat <- cosine(as.matrix(sub_Phip_seq_R3_rpk))
+
+Phip_cos_df <- as.data.frame(Phip_cos_mat)
+Phip_cos_df$name <- rownames(Phip_cos_df)
+
+Phip_cos_df %<>%  left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+ComplexHeatmap::Heatmap(Phip_cos_mat, 
+        cluster_columns  = T,  
+        cluster_rows  = F,
+        show_column_names = FALSE,
+        # column_split  = Phip_mx_df$Outcome.1,
+        row_split = Phip_cos_df$Outcome.1,
+        left_annotation = c(Response_anno,Subject_anno_1),
+          top_annotation = c(Subject_anno))
+```
+
+# Cosine kinetics
+```{r}
+t_sub_Phip_seq <- t(sub_Phip_seq_R3_rpk)
+t_sub_Phip <- as.data.frame(t_sub_Phip_seq) %>% 
+  rownames_to_column("name") %>% left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+t_sub_Phip_seq_long <- t_sub_Phip %>% gather(key = "Protein", value = "Expression", colnames(ab))
+
+split_data_list <- t_sub_Phip_seq_long %>%
+  filter(grepl("PT", Subject_ID)) %>%
+  select(Subject_ID, Protein, name, Expression) %>% 
+  group_by(Subject_ID) %>%
+  group_split() %>%
+  map(~ pivot_wider(.x, names_from = name, values_from = Expression)) %>%
+  set_names(map_chr(., ~ unique(.x$Subject_ID)))
+
+split_data_list <- lapply(split_data_list, function(x) x %>% select(-Subject_ID) %>% column_to_rownames('Protein'))
+
+
+##########################################################################################
+##########################################################################################
+# Initialize a list to store cosine similarity results
+cosine_results <- list()
+
+# Iterate over the list of Subject_IDs
+for (subject_id in names(split_data_list)) {
+  # Extract the data frame
+  data_matrix <- as.matrix(split_data_list[[subject_id]])
+  
+  # Check if the matrix has valid dimensions for cosine similarity calculation
+  if (ncol(data_matrix) > 1 && nrow(data_matrix) > 1) {
+    # Calculate cosine similarity
+    cosine_sim <- cosine(data_matrix)
+    
+    # Store the result in the cosine_results list with the subject ID as the name
+    cosine_results[[subject_id]] <- cosine_sim
+  } else {
+    # Handle cases where the data is insufficient for cosine calculation
+    warning(paste("Skipping Subject_ID:", subject_id, "due to insufficient data"))
+    # No need to assign NA, just skip adding this entry to the list
+  }
+}
+length(cosine_results)
+df_list <- lapply(cosine_results, function(x) x %>% as.data.frame(.) %>% select(matches("day_0"))
+       %>% rename(cosine_index = matches("day_0"))) 
+  
+# Create a function to add an ID column and combine the data frames
+combined_df <- do.call(rbind, lapply(names(df_list), function(name) {
+  cbind(ID = name, df_list[[name]])
+}))
+
+
+##########################################################################################
+# Initialize an empty list to store the Mean tables
+# mean_tables <- list()
+# 
+# # Loop through each element in data_list and extract the Mean table
+# for (patient in names(cosine_results)) {
+#   # Extract the Mean table for the current patient and store it in the list
+#   mean_tables[[patient]] <- cosine_results[[patient]]$Mean
+# }
+# 
+# df_list <- lapply(mean_tables, function(x) x %>% as.data.frame(.) %>% select(matches("day_0"))
+#        %>% rename(cosine_index = matches("day_0"))) 
+#   
+# # Create a function to add an ID column and combine the data frames
+# combined_df <- do.call(rbind, lapply(names(df_list), function(name) {
+#   cbind(ID = name, df_list[[name]])
+# }))
+
+##########################################################################################
+##########################################################################################
+
+# Split the "strings" column into "pt" and "day" columns where applicable
+combined_df$name <- rownames(combined_df)
+cos_combined_df <- combined_df %>% 
+  mutate(pt_day = ifelse(str_detect(name, "pt_"), name, NA)) %>%
+  separate(pt_day, into = c("Subject_ID", "Vac_cycle"), sep = "_(?=day)", extra = "merge", fill = "right") %>% 
+  mutate(Subject_ID = str_replace(Subject_ID, "pt_", "PT_")) %>% 
+  mutate(Vac_cycle = if_else(is.na(Vac_cycle), "day_0", Vac_cycle)) 
+
+cos_combined_df %<>% 
+  left_join(metadata, by =  c("Subject_ID"))  
+
+cos_combined_df %>% 
+ggplot(aes(x = Vac_cycle, y=cosine_index, group = Subject_ID)) + 
+  geom_point() +
+  geom_line(aes(col = Response)) +
+ facet_wrap(~Outcome.1)
+```
+
+# Cosine Day 0 
+```{r}
+t_sub_Phip_seq <- t(sub_Phip_seq_R3_rpk)
+t_sub_Phip_seq_df <- as.data.frame(sub_Phip_seq_R3_rpk)
+
+t_sub_Phip <- as.data.frame(t_sub_Phip_seq) %>% 
+  rownames_to_column("name") %>% left_join(df_Phip_metadata, by =  c("name" = "strings"))
+
+day_0_names <- grep("day_0|HC|HD",df_Phip_metadata$strings, value = T)
+day_0_df <- sub_Phip_seq_R3_rpk %>% select(all_of(day_0_names))
+cos_day_0_mat <- cosine(as.matrix(day_0_df))
+
+cos_day_0_df <- as.data.frame(cos_day_0_mat) %>%  select(cosine_index = pt_1_day_0)
+cos_day_0_df$name <- rownames(cos_day_0_df)
+cos_day_0_df %<>% left_join(df_Phip_metadata, by =  c("name" = "strings"))
+names(cos_day_0_df)
+cos_day_0_df$name
+
+cos_day_0_df %>% 
+ggplot(aes(x = Outcome, y=cosine_index)) + 
+  geom_point() 
+```
+
+
+```{r}
+Phip_seq_long_df <- t_sub_Phip_seq_long %>%  select(name, Subject_ID, Vac_cycle,Response, Outcome, Outcome.1, Protein,  Expression)
+```
+
+
+```{r}
+Phip_df_Tidy.model <- Phip_seq_long_df %>% 
+  filter(Vac_cycle == "day_0") %>% 
+  filter(Response != "HD") %>% 
+  mutate(Outcome.2_Rank = case_when(
+  Outcome %in% c("Good") ~ 2,
+  Outcome %in% c("Bad") ~ 1
+))
+Phip_df_Tidy.model
+
+Pre.lm_full.2 <- Phip_df_Tidy.model %>% nest(data= c(-Protein)) %>%  
+  #filter(Cell.Type != "CD8:Treg Ratio") %>% 
+	mutate(
+		lm_out_full = map(data, ~lm(Outcome.2_Rank ~ Expression, data=.x %>% filter(!is.na(Outcome.2_Rank)) %>% mutate(Outcome.2_Rank=as.numeric(Outcome.2_Rank)))),
+		pval_full = map_dbl(lm_out_full, ~.x %>% broom::tidy() %>% filter(term=="Expression") %>% pull(p.value)),
+	)
+
+Pre.lm_full.2 %>% select(-data, -lm_out_full) %>% arrange(pval_full)
+
+Plot_Outcome.2 <- Pre.lm_full.2 %>% mutate(tidied = map(lm_out_full,conf.int = TRUE, tidy)) %>% 
+  unnest(tidied) %>% select(-data, -lm_out_full) %>% filter(term == "Expression") %>%  mutate_if(is.character,as.factor) %>% arrange(pval_full) 
+
+Plot_Outcome.2 %<>% mutate(sig_value=round(p.value,3))
+
+png(file.path(fig_path, "Forest_Lregression_Outcome_2categ.png"),
+     height=4, width=8, units="in", res=600)
+
+Plot_Outcome.2  %>% filter(p.value <= 0.025) %>% 
+  ggplot(aes(x= estimate , y= fct_reorder(Protein,-sig_value), xmin=conf.low, xmax=conf.high, label = sig_value)) +
+  geom_text(nudge_x = 0.0, nudge_y = 0.4, size=5,color = "black") +
+  geom_pointrange()+ # Makes range for ggplot values based on the data and AES specified in first line
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=0, cex=0.7)+ # Makes whiskers on the range (more aesthetically pleasing)
+  #coord_flip() + # flip coordinates (puts labels on y axis)
+  geom_point(shape = 10, size = 2.5) + # specifies the size and shape of the geompoint
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+    scale_y_discrete(expand = expansion(mult = c(0.1, 0.25)))+
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+   # facet_wrap(~DC , nrow=1)+ # Makes DV header (Can handle multiple DVs)
+  ggtitle("scMEP (2 binary) Outcome Linear Regression")+ # Blank Title for the Graph
+  xlab(" (95% CI)") + 
+  ylab("scMEP Marker") +
+   theme(aspect.ratio = 1/1.75,
+        plot.title = element_text(size = 14, face = "bold"),
+        line = element_line(colour = "black", size = 2), # My personal theme for GGplots
+          strip.text = element_text(size = 15, face ="bold"),              # to label add individual box
+        strip.background = element_rect(fill=NA), 
+        legend.position ="none", 
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_blank(), 
+        panel.border= element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.y = element_text(face="plain", color="black",size=14),  # to label y-axis tics/number labels
+        axis.text.x = element_text(face="plain", color="black",size=14),  # to label y-axis tics/number labels
+        axis.title.x = element_text(face="plain", color="black",size=12, angle = 0,vjust = 0),
+        axis.title.y = element_text(face="plain", color="black",size=14,vjust = 0),                                    
+        axis.ticks = element_blank())
+
+```
+
+
+============================================================================= 
+# RESPONSE
+# 1
+VOLCANO PLOTS PLOTTING LOG FOLD CHANGE and Adjp of SIGNIFICANT METABOLIC MARKERS 
+```{r}
+
+################################
+Phip_seq_long_df$Outcome <- factor(Phip_seq_long_df$Outcome, levels=c("HD","Good","Bad"))
+
+Phip_seq_long_df %>% filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% pull(Outcome)
+
+tidy_Phip_nest <- Phip_seq_long_df %>%  
+  filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% 
+  filter(Vac_cycle == "day_0") %>% 
+ # select(DC:Outcome,all_of(channels_meta)) %>% 
+  #gather(key = "Marker", value = "Expression", all_of(channels_meta)) %>% 
+  group_by(Protein) %>% 
+  nest() 
+
+Model <- tidy_Phip_nest %>% 
+  mutate(model = map(data, ~ lm(formula = Expression ~ Outcome, data = .x)))
+
+Modelunnest <- Model %>% 
+  mutate(coef = map(model, ~tidy(.x))) %>% 
+  unnest(coef) 
+
+head(Modelunnest)
+
+Adj.p_Modelunnest <- Modelunnest %>% 
+  filter(term %in% c("OutcomeBad","(Intercept)")) %>% 
+  mutate(padj = p.adjust(p.value, method="BH")) %>% 
+  rstatix::add_significance(p.col = "padj") # #Using R, here is code that computes BH adjusted p-values and then filters based on your criteria. 
+#%>%filter(padj < 0.075)
+
+Adj.p_Modelunnest <- Adj.p_Modelunnest %>%
+  mutate(term = recode(term, "(Intercept)" = "OutcomeGood"))
+
+OutcomeGood <- Adj.p_Modelunnest %>% filter(term == "OutcomeGood") %>% 
+  select(-data, -model) 
+
+OutcomeBad <- Adj.p_Modelunnest %>% filter(term == "OutcomeBad") %>% 
+  select(-data, -model) 
+
+Metabolic_rBIND <- rbind(OutcomeGood,OutcomeBad)
+Metabolic_rBIND %>% filter(padj < 0.005)
+################################
+Metabolic_rBIND$term %>% unique()
+
+Adj.p_Modelunnest %>% arrange(padj)  %>%  filter(padj < 0.05) %>% 
+   filter(abs(estimate) > 10 ) %>% #filter(term == "OutcomeBad") %>% 
+  ggplot(aes(x= estimate, y = -log2(padj))) +
+  #geom_vline(xintercept = c(-0.3,0.3), col="black", lwd = 0.3, linetype="dashed")+
+  geom_vline(xintercept = 0, col="black", lwd = 0.3)+
+  geom_hline(yintercept= 0.05, col="grey80", lwd = 1)+ geom_point(aes(col = term)) +
+  facet_wrap(~term)
+
+  filter(abs(estimate) > 5 )  
+
+theme_bw() 
+    geom_point(data = subset(Adj.p_Modelunnest, padj <= 0.005), aes(color = term), alpha=0.85, size = 4)
+    geom_point(data = subset(Adj.p_Modelunnest, padj > 0.005), aes(color = term),alpha=0.35, size = 3)
+
+```
+# 2
+```{r}
+prot_interest <- Adj.p_Modelunnest %>% #filter(term == "OutcomeGood") %>% 
+  #filter(estimate > 0) %>% 
+  arrange(padj)  %>%  filter(padj < 0.05) %>% filter(grepl("TYR|MAGE|MLAN|KRT",Protein)) %>% pull(Protein)
+
+prot_interest_signif <- Adj.p_Modelunnest %>% #filter(term == "OutcomeGood") %>% 
+  #filter(estimate > 0) %>% 
+  arrange(padj)  %>%  filter(padj < 0.000001) %>%  pull(Protein)
+
+Phip_seq_long_df$Expression 
+Phip_seq_long_df %>%  filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% 
+  filter(Vac_cycle == "day_0") %>% 
+  filter(Protein %in% c("RBM17","QTRT1","ENO3")) %>% 
+ggplot(aes(x = Outcome, y=Expression)) + 
+  geom_point() + facet_wrap(~Protein, scales = "free")
+
+Phip_seq_long_df %>%  filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% 
+  filter(Vac_cycle == "day_0") %>% 
+  filter(Protein %in% c(prot_interest)) %>% 
+ggplot(aes(x = Outcome, y=Expression)) + 
+  geom_point() + facet_wrap(~Protein, scales = "free")
+
+
+Phip_seq_long_df %>%  filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% 
+  #filter(Vac_cycle == "day_0") %>% 
+  filter(Protein %in% c(prot_interest)) %>% 
+ggplot(aes(x = Vac_cycle, y=Expression)) + 
+  geom_point() + #+ facet_wrap(~Protein, scales = "free")
+geom_line(aes(group = Subject_ID)) +
+  facet_wrap(~Protein, scales = "free")
+
+heatmap(as.matrix(filt_raw_df %>% select(matches("DAY_0"))))
+```
+
+# 3
+```{r}
+sub_Phip_seq_R3_rpk$gene <- rownames(sub_Phip_seq_R3_rpk)
+sub_tab <- sub_Phip_seq_R3_rpk %>% filter(gene %in% c(prot_interest_signif)) %>% select(-gene)
+t_sub_tab <- t(sub_tab)
+t_sub_tab <- as.data.frame(t_sub_tab)
+t_sub_tab$name <- rownames(t_sub_tab)
+t_sub_tab 
+
+t_sub_tab_meta <- t_sub_tab %>%  left_join(df_Phip_metadata, by =  c("name" = "strings")) #%>% filter(Vac_cycle == "day_0")
+d0 <- t_sub_tab_meta #%>% filter(Vac_cycle == "day_0")
+as.matrix(d0 %>% select(all_of(prot_interest_signif)))
+t_sub_tab$name <- NULL
+
+Response_anno = ComplexHeatmap::rowAnnotation(Response = t_sub_tab_meta$Outcome,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F,
+                        col = list(Response = c(colors_LHB$Outcome)))
+
+ComplexHeatmap::Heatmap(as.matrix(d0 %>% select(all_of(prot_interest_signif))), 
+        cluster_columns  = T,  
+        cluster_rows  = T,
+        show_column_names = FALSE,
+        left_annotation = c(Response_anno),
+        row_split  = t_sub_tab_meta$Vac_cycle)
+        #row_split = t_sub_tab_meta$Outcome)
+        #left_annotation = c(Response_anno,Subject_anno_1),
+        
+```
+
+
+
+# 4
+```{r}
+library(purrr)
+library(broom)
+
+Phip_seq_long_df <- t_sub_Phip_seq_long %>%  select(name, Subject_ID, Vac_cycle, Outcome, Outcome.1, Protein,  Expression)
+
+Phip_seq_long_df_model <- Phip_seq_long_df %>% 
+  mutate(Outcome.1_Rank = case_when(
+  Outcome %in% c("HD") ~ 3,
+  Outcome %in% c("Good") ~ 2,
+  Outcome %in% c("Bad") ~ 1
+))
+
+Pre.lm_full <- Phip_seq_long_df_model %>% 
+  filter(Vac_cycle == "day_0") %>% 
+  nest(data= c( -Protein)) %>%  
+  #filter(Cell.Type != "CD8:Treg Ratio") %>% 
+	mutate(
+		lm_out_full = map(data, ~lm(Outcome.1_Rank ~ Expression, data=.x %>% filter(!is.na(Outcome.1_Rank)) %>% mutate(Outcome.1_Rank=as.numeric(Outcome.1_Rank)))),
+		pval_full = map_dbl(lm_out_full, ~.x %>% broom::tidy() %>% filter(term=="Expression") %>% pull(p.value)),
+	)
+
+Pre.lm_full %>% select(-data, -lm_out_full) %>% arrange(pval_full)
+
+
+Plot_Outcome.1 <- Pre.lm_full %>% mutate(tidied = map(lm_out_full,conf.int = TRUE, tidy)) %>% 
+  unnest(tidied) %>% select(-data, -lm_out_full) %>% filter(term == "Expression") %>%  mutate_if(is.character,as.factor) %>% arrange(pval_full) 
+
+Plot_Outcome.1 %<>% mutate(sig_value=round(p.value,3))
+
+dput(as.character(Plot_Outcome.1  %>% filter(p.value <= 0.05) %>%
+                    filter(estimate >0) %>% 
+                    pull(Protein)))
+
+```
+
+
+
+# 5
+```{r}
+Plot_Outcome.1  %>% filter(estimate < 0) %>% filter(p.value <= 0.005) %>%  
+  ggplot(aes(x= estimate , y= fct_reorder(Protein,-sig_value), xmin=conf.low, xmax=conf.high, label = sig_value)) +
+  geom_text(nudge_x = 0.0, nudge_y = 0.4, size=5,color = "black") +
+  geom_pointrange()+ # Makes range for ggplot values based on the data and AES specified in first line
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=0, cex=0.7)+ # Makes whiskers on the range (more aesthetically pleasing)
+  #coord_flip() + # flip coordinates (puts labels on y axis)
+  geom_point(shape = 10, size = 2.5) + # specifies the size and shape of the geompoint
+    scale_y_discrete(expand = expansion(mult = c(0.1, 0.25)))+
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+    #facet_wrap(~DC , nrow=1 )+ # Makes DV header (Can handle multiple DVs)
+  ggtitle("scMEP (3 binary) Outcome Linear Regression")+ # Blank Title for the Graph
+  xlab(" (95% CI)") + 
+  ylab("scMEP Marker") +
+   theme(aspect.ratio = 1/1,
+        plot.title = element_text(size = 14, face = "bold"),
+        line = element_line(colour = "black", size = 2), # My personal theme for GGplots
+          strip.text = element_text(size = 15, face ="bold"),              # to label add individual box
+        strip.background = element_rect(fill=NA), 
+        legend.position ="none", 
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_blank(), 
+        panel.border= element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.y = element_text(face="plain", color="black",size=14),  # to label y-axis tics/number labels
+        axis.text.x = element_text(face="plain", color="black",size=14),  # to label y-axis tics/number labels
+        axis.title.x = element_text(face="plain", color="black",size=12, angle = 0,vjust = 0),
+        axis.title.y = element_text(face="plain", color="black",size=14,vjust = 0),                                    
+        axis.ticks = element_blank())
+
+Plot_Outcome.1 %>% #filter(padj.y <= 0.05) %>% 
+  ggplot(aes(x= estimate, y = -log2(padj)))+
+  #geom_vline(xintercept = c(-0.3,0.3), col="black", lwd = 0.3, linetype="dashed")+
+  geom_vline(xintercept = 0, col="black", lwd = 0.3)+
+  geom_hline(yintercept= -log2(0.05), col="grey80", lwd = 1)+ 
+  theme_bw()
+```
+
+
+
+
+
+
+
+
+
+
+### Choose Analytes
+```{r}
+#list of analytes
+div_measure_list <- as.list(levels(factor(Phip.seq.0h.div %>% select(Shannon.Index:Clonality) %>% names())))
+names(div_measure_list) <- levels(factor(Phip.seq.0h.div %>% select(Shannon.Index:Clonality) %>% names()))
+div_measure = div_measure_list$Richness
+```
+
+- comparisons of peripheral immune cell levels at different doses
+```{r}
+jitter_1 <- position_jitter(width = 0.1, height = 0)
+jitter_2 <- position_jitter(width = 0.35, height = 0)
+
+div_measure = div_measure_list$Richness
+measurement = "Clonality"
+
+colnames(metadata_df_v2)
+metadata_df_v2$Subject_ID
+Phip.seq.0h.div$Subject_ID
+view(metadata_df_v2)
+
+Phip.seq.0h.div %<>% full_join(metadata_df_v2 %>% select(-c(Cancer)) , by = 'Subject_ID')
+Phip.seq.0h.div$Best_Clinical_outcome
+
+Phip.seq.0h.div %>% 
+  #filter(primary_tumor_type %in% c("EBV+ Nasopharyngeal","NSCLC","HNSCC")) %>% 
+  ggplot(aes(x= Best_Clinical_outcome, y= Richness)) + 
+  #stat_summary(fun=median, geom="point", size=5, color="black",alpha = 0.9)+
+  geom_point(pch=16,position=jitter_1, aes(color=Best_Clinical_outcome), size=2, alpha=0.7) + 
+   geom_line(aes(group=Subject_ID), color = "grey80") +
+  geom_boxplot(aes(fill=Best_Clinical_outcome),outlier.colour = NA)
+ # scale_color_manual(values=c(colors_ja$time)) + 
+  #scale_fill_manual(values=alpha(c(colors_ja$time), 0.2)) + 
+   # stat_compare_means(comparisons = list(c("Pre", "On")),
+   #                       method = "wilcox",tip.length = 0.0, 
+   #                    label.y = c(0.5), size = 4) +
+  #facet_wrap(~therapy, scales = "free" , nrow =1)+
+  theme_bw() + 
+  xlab("Response") +
+  ylab(paste(measurement, " Index")) + ggtitle(paste(measurement, "Index"),"of TCR Beta clonotypes")+
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2))) +
+ labs(colour= "Therapy",
+       fill= "Therapy") + Theme_TCR.1
+```
+
+```{r}
+names(Phip.seq.0h.div)
+Phip.seq.cut.PFS <- surv_cutpoint(Phip.seq.0h.div,
+                             time = "PFS", event = "pd_status",
+                         variables = c("Shannon.Index","Invsimpson.Index","Richness","Pielou_Evenness","Clonality"))
+```
+
+# COX
+### OS
+```{r}
+Phip_seq_long_df <- t_sub_Phip_seq_long %>%  select(name, Subject_ID, Vac_cycle, Outcome, Response,
+                                                    Outcome.1, Protein,  Expression,PFS, 
+                                                    Overall_Survival,death_ind, PFS_ind)
+
+Phip_seq_long_df %>% names()
+tidy_day0_nest <- t_sub_Phip_seq_long %>%  
+   filter(Vac_cycle == "day_0") %>% 
+  filter(Response != "HD") %>%  
+  group_by(Protein) %>% 
+  nest() 
+
+Model_Cox_OS <- tidy_day0_nest %>% 
+  mutate(model = map(data, ~ coxph(Surv(Overall_Survival, death_ind) ~ Expression, data = .x)))
+
+Unnest_Model_Cox_OS <- Model_Cox_OS %>% 
+  mutate(coef = map(model, ~tidy(.x,conf.int = TRUE))) %>% 
+  unnest(coef) 
+
+####
+# Round p.values to 3 Sig figs
+Unnest_Model_Cox_OS <- Unnest_Model_Cox_OS %>% 
+  mutate(sig_value=round(p.value,3))
+
+head(Unnest_Model_Cox_OS)
+
+Phip_seq_long_df %>%  filter(Outcome %in% c("Good","Bad")) %>% droplevels() %>% 
+  filter(Vac_cycle == "day_0") %>% 
+  filter(Protein %in% c("RBM17","BAK1","VHL")) %>% 
+ggplot(aes(x = Outcome, y=Expression)) + 
+  geom_point() + facet_wrap(~Protein, scales = "free")
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein)) %>% pull(Protein)
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 0.5) %>% 
+  head(30)
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein))
+
+  Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 0.5) %>% 
+  head(30) %>% 
+  #filter(grepl("TYR|MAGE|MLAN|KRT",Protein)) %>% 
+  ggplot(aes(x= estimate , y= fct_rev(Protein) , xmin=conf.low, xmax=conf.high, label =sig_value)) +
+  geom_text(nudge_x = 0,nudge_y = 0.4, size=3.5) +
+  geom_pointrange()+ # Makes range for ggplot values based on the data and AES specified in first line
+  geom_hline(yintercept=0, lty=2, size =1) +  # add a dotted line at x=0 after flip
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=0, cex=0.7)+ # Makes whiskers on the range (more aesthetically pleasing)
+  #coord_flip() + # flip coordinates (puts labels on y axis)
+  geom_point(shape = 10, size = 2) + # specifies the size and shape of the geompoint
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+  ggtitle("scMEP marker association with OS")+ # Blank Title for the Graph
+  xlab("Hazard Ratio (95% CI)") + 
+  ylab("Markers") + #xlim(-10,10) +
+  #facet_wrap(~DC , ncol=1 , scales = "free_y")+ # Makes DV header (Can handle multiple DVs)
+  #scale_x_continuous(limits = c(-20,20), breaks = c(-10,-5,0,5,10)) # limits and tic marks on X axis (flipped specification do to coord_flip)
+  theme(aspect.ratio = 1/1,
+        line = element_line(colour = "black", size = 2), # My personal theme for GGplots
+        strip.text = element_text(size = 10, face ="bold"),
+        strip.background = element_rect(fill=NA), 
+        legend.position ="none", 
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_blank(), 
+        panel.border= element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.y = element_text(face="plain", color="black",size=10),  # to label y-axis tics/number labels
+        axis.title.x = element_text(face="plain", color="black",size=10, angle = 0,vjust = 0),
+        axis.title.y = element_text(face="plain", color="black",size=12,vjust = 0),                                    # to label/remove y-axis labels
+        axis.ticks = element_blank())
+# dev.off() 
+##############
+```
+
+# PFS
+```{r}
+tidy_day0_nest <- t_sub_Phip_seq_long %>%  
+   filter(Vac_cycle == "day_0") %>% 
+  filter(Response != "HD") %>%  
+  group_by(Protein) %>% 
+  nest() 
+
+
+Model_Cox_PFS <- tidy_day0_nest %>% 
+  mutate(model = map(data, ~ coxph(Surv(PFS, PFS_ind) ~ Expression, data = .x)))
+
+Unnest_Model_Cox_PFS <- Model_Cox_PFS %>% 
+  mutate(coef = map(model, ~tidy(.x,conf.int = TRUE))) %>% 
+  unnest(coef) 
+
+####
+# Round p.values to 3 Sig figs
+Unnest_Model_Cox_PFS <- Unnest_Model_Cox_PFS %>% 
+  mutate(sig_value=round(p.value,3))
+
+
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(estimate < 0) %>%  pull(Protein)
+
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 0.5) %>% 
+  head(30)
+
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein))
+
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.01) %>% filter(abs(estimate) >= 1) 
+#head(30) %>% 
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein)) 
+
+Unnest_Model_Cox_PFS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 1) %>% head(30) %>% 
+
+  ggplot(aes(x= estimate , y= fct_rev(Protein) , xmin=conf.low, xmax=conf.high, label =sig_value)) +
+  geom_text(nudge_x = 0,nudge_y = 0.1, size=3.5) +
+  geom_pointrange()+ # Makes range for ggplot values based on the data and AES specified in first line
+  geom_hline(yintercept=0, lty=2, size =1) +  # add a dotted line at x=0 after flip
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=0, cex=0.7)+ # Makes whiskers on the range (more aesthetically pleasing)
+  #coord_flip() + # flip coordinates (puts labels on y axis)
+  geom_point(shape = 10, size = 2) + # specifies the size and shape of the geompoint
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+  ggtitle("scMEP marker association with PFS")+ # Blank Title for the Graph
+  xlab("Hazard Ratio (95% CI)") + 
+  ylab("Markers") + xlim(-4.5,2) +
+ # facet_wrap(~DC , ncol=1 , scales = "free_y")+ # Makes DV header (Can handle multiple DVs)
+  #scale_x_continuous(limits = c(-20,20), breaks = c(-10,-5,0,5,10)) # limits and tic marks on X axis (flipped specification do to coord_flip)
+  theme(aspect.ratio = 1/1.5,
+        line = element_line(colour = "black", size = 2), # My personal theme for GGplots
+        strip.text = element_text(size = 10, face ="bold"),
+        strip.background = element_rect(fill=NA), 
+        legend.position ="none", 
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_blank(), 
+        panel.border= element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.y = element_text(face="plain", color="black",size=10),  # to label y-axis tics/number labels
+        axis.title.x = element_text(face="plain", color="black",size=10, angle = 0,vjust = 0),
+        axis.title.y = element_text(face="plain", color="black",size=12,vjust = 0),                                    # to label/remove y-axis labels
+        axis.ticks = element_blank())
+# dev.off() 
+##############
+```
+
+### PFS analysis
+```{r}
+gene_to_plot <- "ARTN"
+index_select = "Phip-seq PFS"
+# Phip_seq_long_df$PFS_ind
+# dfa_mh <- calculate_median(result_df %>% 
+#                                filter(Vac_cycle == "day_0") %>% 
+#                           filter(!is.na(days_since_baseline)),mh_index)
+
+Phip.cut.PFS <- surv_cutpoint(t_sub_Phip_seq_long %>%  
+                                  filter(Vac_cycle == "day_0") %>% 
+                                filter(Response != "HD") %>% 
+                                filter(grepl(gene_to_plot,Protein)),
+                             time = "PFS", event = "PFS_ind",
+                         variables = c("Expression"))
+
+res.PFS <- surv_categorize(Phip.cut.PFS)
+
+Phip_fit <- survfit(Surv(PFS, PFS_ind) ~ Expression, data = res.PFS)
+
+#TCR_fit
+
+ggsurvplot(Phip_fit, data = res.PFS,
+           title = paste0(index_select, "\n", gene_to_plot),
+           conf.int = TRUE,
+           xlab = "Time (days)", # customize X axis label
+           conf.int.alpha = 0.2,
+           pval = TRUE,    # Add p-value
+           pval.size = 5, # adjust p-value size
+           surv.median.line = "hv",            # Add median survival lines
+           legend.title = paste0(index_select),  # Change legend titles
+           #legend.labs = levels(cutpoint),  # Change legend labels
+           legend = "bottom",
+           palette = c("#E7B800", "#2E9FDF"),
+             # if(grepl("Tregs",analyte)){
+             # palette = Treg_pallete} else {
+             #   palette = c("#E7B800", "#2E9FDF")
+             #   },
+           risk.table = TRUE,                  # Add No at risk table
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.2,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE)       
+```
+
+
+# OS
+```{r}
+tidy_day0_nest <- t_sub_Phip_seq_long %>%  
+   filter(Vac_cycle == "day_0") %>% 
+  filter(Response != "HD") %>%  
+  group_by(Protein) %>% 
+  nest() 
+t_sub_Phip_seq_long$death_ind
+
+Model_Cox_OS <- tidy_day0_nest %>% 
+  mutate(model = map(data, ~ coxph(Surv(Overall_Survival, death_ind) ~ Expression, data = .x)))
+
+Unnest_Model_Cox_OS <- Model_Cox_OS %>% 
+  mutate(coef = map(model, ~tidy(.x,conf.int = TRUE))) %>% 
+  unnest(coef) 
+
+####
+# Round p.values to 3 Sig figs
+Unnest_Model_Cox_OS <- Unnest_Model_Cox_OS %>% 
+  mutate(sig_value=round(p.value,3))
+
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(estimate < 0) %>%  pull(Protein)
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 0.5) %>% 
+  head(30)
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein))
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.001) %>% filter(abs(estimate) >= 1) 
+#head(30) %>% 
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% 
+  filter(grepl("TYR|MAGE|MLAN|KRT",Protein)) 
+
+Unnest_Model_Cox_OS %>% arrange(p.value) %>% filter(p.value < 0.05) %>% filter(abs(estimate) >= 1) %>% head(30) %>% 
+
+  ggplot(aes(x= estimate , y= fct_rev(Protein) , xmin=conf.low, xmax=conf.high, label =sig_value)) +
+  geom_text(nudge_x = 0,nudge_y = 0.1, size=3.5) +
+  geom_pointrange()+ # Makes range for ggplot values based on the data and AES specified in first line
+  geom_hline(yintercept=0, lty=2, size =1) +  # add a dotted line at x=0 after flip
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high), width=0, cex=0.7)+ # Makes whiskers on the range (more aesthetically pleasing)
+  #coord_flip() + # flip coordinates (puts labels on y axis)
+  geom_point(shape = 10, size = 2) + # specifies the size and shape of the geompoint
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", cex = 1, alpha = 0.5) +
+  ggtitle("scMEP marker association with PFS")+ # Blank Title for the Graph
+  xlab("Hazard Ratio (95% CI)") + 
+  ylab("Markers") + xlim(-4.5,2) +
+ # facet_wrap(~DC , ncol=1 , scales = "free_y")+ # Makes DV header (Can handle multiple DVs)
+  #scale_x_continuous(limits = c(-20,20), breaks = c(-10,-5,0,5,10)) # limits and tic marks on X axis (flipped specification do to coord_flip)
+  theme(aspect.ratio = 1/1.5,
+        line = element_line(colour = "black", size = 2), # My personal theme for GGplots
+        strip.text = element_text(size = 10, face ="bold"),
+        strip.background = element_rect(fill=NA), 
+        legend.position ="none", 
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_blank(), 
+        panel.border= element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(),
+        axis.text.y = element_text(face="plain", color="black",size=10),  # to label y-axis tics/number labels
+        axis.title.x = element_text(face="plain", color="black",size=10, angle = 0,vjust = 0),
+        axis.title.y = element_text(face="plain", color="black",size=12,vjust = 0),                                    # to label/remove y-axis labels
+        axis.ticks = element_blank())
+# dev.off() 
+##############
+```
+
+### OS analysis
+```{r}
+gene_to_plot <- "DLX1"
+index_select = "Phip-seq OS"
+# Phip_seq_long_df$PFS_ind
+# dfa_mh <- calculate_median(result_df %>% 
+#                                filter(Vac_cycle == "day_0") %>% 
+#                           filter(!is.na(days_since_baseline)),mh_index)
+t_sub_Phip_seq_long$Overall_Survival
+Phip.cut.OS <- surv_cutpoint(t_sub_Phip_seq_long %>%  
+                                  filter(Vac_cycle == "day_0") %>% 
+                                filter(Response != "HD") %>% 
+                                filter(grepl(gene_to_plot,Protein)),
+                             time = "Overall_Survival", event = "death_ind",
+                         variables = c("Expression"))
+
+res.OS <- surv_categorize(Phip.cut.OS)
+
+Phip_fit_OS <- survfit(Surv(Overall_Survival, death_ind) ~ Expression, data = res.OS)
+
+#TCR_fit
+
+ggsurvplot(Phip_fit_OS, data = res.OS,
+           title = paste0(index_select, "\n", gene_to_plot),
+           conf.int = TRUE,
+           xlab = "Time (days)", # customize X axis label
+           conf.int.alpha = 0.2,
+           pval = TRUE,    # Add p-value
+           pval.size = 5, # adjust p-value size
+           surv.median.line = "hv",            # Add median survival lines
+           legend.title = paste0(index_select),  # Change legend titles
+           #legend.labs = levels(cutpoint),  # Change legend labels
+           legend = "bottom",
+           palette = c("#E7B800", "#2E9FDF"),
+             # if(grepl("Tregs",analyte)){
+             # palette = Treg_pallete} else {
+             #   palette = c("#E7B800", "#2E9FDF")
+             #   },
+           risk.table = TRUE,                  # Add No at risk table
+           cumevents = FALSE,                   # Add cumulative No of events table
+           tables.height = 0.2,               # Specify tables height
+           tables.theme = theme_cleantable(),  # Clean theme for tables
+           tables.y.text = FALSE)       
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+TCR_Div <- TCR_2023_Meta %>% 
+    filter(TCR_type != "tcr_delta_clone") %>% 
+  #filter(Pre_Blood_TME_overlaps == "2_Overlap") %>%
+  group_by(Sample_type,TCR_type,Time,Sample_Name) %>%      
+  tidyr::nest() %>%      
+  # Diversity
+  mutate(Shannon.Index = map(data, ~diversity(.$sum_Clone.Count, "shannon"))) %>% unnest(Shannon.Index) %>% 
+  mutate(Simpson.Index = map(data, ~diversity(.$sum_Clone.Count, "simpson"))) %>% unnest(Simpson.Index) %>% 
+  mutate(Invsimpson.Index = map(data, ~diversity(.$sum_Clone.Count, "invsimpson"))) %>% unnest(Invsimpson.Index) %>% 
+  # Observed Richness
+  mutate(Richness = map(data, ~specnumber(.$sum_Clone.Count, MARGIN = 1))) %>% unnest(Richness) %>% unnest(data)
+```
+
+
+
+```{r}
+## calculating statistics 
+### Baseline
+
+Phip_statistics_df <- Phip_seq_final %>%
+  filter(Lysate == "Round3") %>%
+  filter(Visit_Name_time == "DAY_0") %>%
+  select(Cancer, Protein, value) %>%
+  group_by(Protein) %>%
+  #### Calculating statistics
+  summarise(
+    lfc = log2(mean(value[Cancer == "Melanoma"]) / mean(value[Cancer == "HD"])),
+    median_diff = median(value[Cancer == "Melanoma"])-median(value[Cancer == "HD"]),
+    mean_diff = mean(value[Cancer == "Melanoma"])-mean(value[Cancer == "HD"]),
+    max_value_cancer = max(value[Cancer == "Melanoma"]),
+    max_value_hd = max(value[Cancer == "HD"]),
+    p_value = t.test(value[Cancer == "Melanoma"], value[Cancer == "HD"], na.action = na.omit)$p.value
+  ) %>%
+  mutate(max_diff = max_value_cancer - max_value_hd) 
+
+Phip_statistics_df
+```
+
+
+
+
+
+
+
+
+```{r}
+keep <- rowSums(raw_df[2:ncol(raw_df)]) > 0
+filt_raw_df <- raw_df[keep,]
+filt_raw_df <- as.data.frame(filt_raw_df) %>% column_to_rownames("...1")
+dim(raw_df)
+dim(filt_raw_df)
+
+vtable::st(filt_raw_df)
+filt_raw_df$Protein <- rownames(filt_raw_df)
+
+hist(log(raw_meta_df$value), breaks = 1000)
+
+heatmap(as.matrix(filt_raw_df %>% select(matches("DAY_0"))))
+```
+
+
+```{r}
+## Cleaning metadata
+metadata_df_v2 <- metadata_df %>%
+    ### Renaming the columns and patient information to be consistent with the data
+    rename(Subject_ID = patient_numbers) %>%
+    mutate(Subject_ID = gsub("pt_", "PT_", Subject_ID)) %>%
+    mutate(Subject_ID = gsub("PT_H", "H", Subject_ID)) %>%
+    ### Removing the HC, these are subjects that only exist in the PhiP seq data
+    filter(!grepl("^HC", Subject_ID)) %>%
+    ### Renaming cancer to HD and Melanoma
+    mutate(Cancer = ifelse(Cancer == "None", "HD", ifelse(Cancer == "Yes", "Melanoma", Cancer)))
+  
+
+  ## It appears in the data it is KIR2DL2, but in the annotation table it is KI2L2
+  ## There is also something called LOC348174 that isn't found in the annotation table, everything else appears accounted for
+  
+  
+  ## Here I am showing what is present in the data, yet absent in the annoataion data frame
+  setdiff(raw_df %>% select("...1") %>% unique() %>% pull(),annotation_df$protein)
+  
+  ## Changing the name of the protein to reflect its call in the data frame
+  ## LOC348174 looks to be some kind of vector, potentially an artifact
+  annotation_df_v2 <- annotation_df %>%
+    mutate(protein = ifelse(protein == "KI2L2", "KIR2DL2", protein)) %>%
+    rename(Protein = protein) %>%
+    unique()
+  
+  get_dupes(as.data.frame(annotation_df_v2$Protein))
+  ## The annotation table doesn't appear to be uniquely identified 
+  problematic_annotations <- annotation_df_v2 %>%
+    group_by(Protein) %>%
+    count() %>%
+    arrange(desc(n)) %>%
+    filter(n > 1) %>% pull(Protein)
+
+  
+  
+  raw_meta_df <- filt_raw_df %>%
+    rename(Protein = "...1") %>%
+    pivot_longer(., cols = -c(Protein)) %>%
+    mutate(Subject_ID = gsub("^([^_]+_[^_]+).*", "\\1", name)) %>%
+    mutate(Visit_Name_time = gsub("^([^_]+_[^_]+_)(.*)", "\\2", name)) %>%
+    
+    ### Making the healthy donor timepoints equal to Day 0 
+    mutate(Visit_Name_time = ifelse(str_starts(Subject_ID, "HD"), "DAY_0", Visit_Name_time)) %>% 
+    left_join(.,annotation_df_v2) %>%
+    rename(Subject_Visit = name) %>%
+    left_join(., metadata_df_v2)
+  
+
+ 
+  raw_statistics_df <- raw_meta_df %>%
+    filter(Visit_Name_time == "DAY_0") %>%
+    select(Cancer, Protein, value) %>%
+    group_by(Protein) %>%
+    #### Calculating statistics
+    summarise(
+      lfc = log2(mean(value[Cancer == "Melanoma"]) / mean(value[Cancer == "HD"])),
+      median_diff = median(value[Cancer == "Melanoma"])-median(value[Cancer == "HD"]),
+      mean_diff = mean(value[Cancer == "Melanoma"])-mean(value[Cancer == "HD"]),
+      max_value_cancer = max(value[Cancer == "Melanoma"]),
+      max_value_hd = max(value[Cancer == "HD"]),
+      p_value = t.test(value[Cancer == "Melanoma"], value[Cancer == "HD"], na.action = na.omit)$p.value
+    ) %>%
+    mutate(max_diff = max_value_cancer - max_value_hd)
+  
+  ### The infinite log fold change means it's detected in cancer patients, but in none of the healthy donors
+  unique_cancer_patients <- raw_statistics_df %>%
+    filter(lfc == Inf) %>% pull(Protein)
+
+   
+raw_statistics_df %>% arrange(desc(lfc))  %>% filter(p_value < 0.05) %>% head(20)
+  
+```
+
+# volcano_plot
+```{r}
+volcano_plot <-  raw_statistics_df %>%
+#  filter(p_value < 0.05) %>%
+  ## removing the Epitope
+  filter(!grepl("_Epitope", Protein)) %>%
+  left_join(., annotation_df_v2) %>%
+  #filter(lfc != Inf & lfc != -Inf) %>%
+  ggplot(., aes(x = lfc, y = -log(p_value), color = p_value))+
+  geom_point(size =2) +
+  theme_prism() +
+  #xlim(-20,20) +
+  #ylim(0,10.9) +
+  ylab("-Log(p value)") +
+  xlab("Log2 fold change") +
+  #ggtitle("Baseline") +
+    scale_color_gradient2(low = "blue", mid = "gray", high = "red", midpoint = 0) +
+    #geom_text(x = Inf, y = Inf, label = "Up in Melanoma", hjust = 1.5, vjust = 1, color = "red", size =5) +
+    #geom_text(x = -Inf, y = Inf, label = "Up in Healthy Donors", hjust = -0.75, vjust = 1, color = "blue", size = 5) +
+    theme(legend.position = "none") 
+      #geom_text_repel(data = subset(raw_statistics_df %>%
+      #                                ## removing the Epitope
+      #                                filter(!grepl("_Epitope", Protein)), 
+      #                              #`p_value` < 0.25  & lfc >1 &
+      #                              `p_value` < 0.25  &
+      #                                lfc > 1 &
+      #                                max_diff > 1), 
+      #                aes(label = Protein),
+      #                size = 3,
+      #                direction = "both",
+      #                max.overlaps = 20,min.segment.length = 0.01, box.padding = 0.25, color = "black") +
+volcano_plot
+
+#ggsave(filename = "volcano_plot.png", plot = volcano_plot, width = 4, height = 4, dpi = 600)
+```
+

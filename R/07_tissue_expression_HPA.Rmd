@@ -1,0 +1,1258 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-09-19"
+editor_options: 
+  chunk_output_type: console
+---
+
+---
+  title: "05_find_tissue_specific_genes_human_protein_atlas"
+author: "Ming Tang"
+date: "6/15/2023"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+  http://www.bioconductor.org/packages/devel/bioc/vignettes/HPAanalyze/inst/doc/b_HPAanalyze_indepth.html
+
+
+```{r}
+if (file.exists("setup.R")) source("setup.R") else source(file.path("R", "setup.R"))
+library(HPAanalyze)
+if (file.exists("gene_tissue_classification_source.R")) {
+  source("gene_tissue_classification_source.R")
+} else source(file.path("R", "gene_tissue_classification_source.R"))
+```
+
+# Download HPA datasets
+```{r}
+downloadedData$normal_tissue %>%
+  janitor::tabyl(tissue)
+
+# TISSUE SITE
+##############################################################################################################################
+# Split the 'Tissues' column into separate rows
+# tissues_tbl <- tissues_tbl %>%
+#   separate_rows(Tissues, sep = ", ") %>%
+#   arrange(Category)
+
+downloadedData$normal_tissue$level
+tissue.tab <- downloadedData$normal_tissue %>%   filter(level %in% c("High","Mid","Low")) %>% dplyr::select(Gene = gene, tissue)
+
+tissue.tab %<>%   mutate(tissue_combined = str_replace_all(tissue, c("stomach \\d+" = "stomach", 
+                                                     "skin \\d+" = "skin",
+                                                     "endometrium \\d+" = "endometrium",
+                                                     "soft tissue \\d+" = "soft tissue"))) %>% dplyr::select(-tissue) %>% distinct() %>% 
+  dplyr::rename("tissue" = "tissue_combined")
+dim(tissue.tab)  
+tissue.tab %<>% left_join(anatomical_categories, by = c("tissue" = "Term"))
+
+tissue.tab[, names(tissue.tab) %in% c("Gene","Category")] %>% distinct()
+tissue.tab %>% distinct(Category)
+
+# CELLUAR LOCALIZATION
+##############################################################################################################################
+cell.location.tbl <- downloadedData$subcellular_location %>%
+  dplyr::select(Gene = gene, main_location) %>% distinct()
+
+cell.location.tbl %<>% 
+  mutate(first_location = sub(";.*", "", main_location)) %>% 
+  mutate(first_location = if_else(is.na(first_location), "Mitochondria", first_location)) 
+
+cell.location.tbl %>% pull(first_location) %>% unique()
+
+cell.location.tbl %<>% left_join(cell_structure_categories, by = c("first_location" = "Term")) %>% 
+  dplyr::select(-main_location, cellular_location = first_location)
+```
+
+### $ CLUST.combined.df
+```{r}
+combined_df
+
+CLUST.genes.to.tissue.map <- c(CLUST_6_filters,
+CLUST_2_filters,
+CLUST_9_filters,
+CLUST_10_filters,
+CLUST_8_filters,
+CLUST_5_filters,
+CLUST_11_filters,
+CLUST_7_filters,
+CLUST_3_filters) %>% unique()
+
+CLUST.combined.df <- combined_df %>% filter(Description %in% CLUST.genes.to.tissue.map) 
+```
+
+```{r}
+###################
+CLUST.genes <- CLUST.combined.df %>%
+  pull(geneID_split) %>%
+  as.character() %>%
+  strsplit(" ") %>%    # Split by space
+  unlist() %>%  unique()
+
+CLUST.genes %>% length() # 1591 genes 
+###################
+# clust.tab is original DF from getting DEGPatterns
+CLUST.tab <- clust.tab %>% filter(genes %in% CLUST.genes)
+
+HPA_tab <- cell.location.tbl
+CLUST.tab.tissue <- CLUST.tab %>% 
+  #filter(Gene %in% c(limma_toptab %>% pull(Gene))) %>% 
+  left_join(HPA_tab, by = c("genes" = "Gene")) %>% 
+  mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+         cellular_location = if_else(is.na(cellular_location), "Not mapped", cellular_location))
+
+CLUST.tab.tissue$cellular_location %>% unique()
+abc <- CLUST.tab.tissue %>% dplyr::select(-c(Vac_cycle,Outcome,Outcome_cycle,cellular_location,value)) %>% distinct() %>% 
+  #filter(grepl("Integument",Category)) %>% 
+  #filter(cluster == "1") %>% 
+  group_by(genes,cluster) %>% 
+  summarize(Category = paste(unique(Category), collapse = ";"), .groups = 'drop') 
+  #column_to_rownames("genes") #%>% as.matrix()
+head(abc)
+
+aa_meta <- abc %>% pivot_wider(
+    names_from = genes, 
+    values_from = "Category")
+
+abc$Category %>% unique()
+```
+
+
+# Immmune_annotation
+- from REAP data
+```{r}
+Immmune_annotation <- read_csv(paste0(data_path, "/library_annotation.csv"))
+Immmune_annotation %<>% dplyr::select(gene_name, annotation_group:reactome_group) %>% distinct()
+Immmune_annotation %<>% filter(!is.na(gene_name))
+Immmune_annotation %<>% 
+  distinct(gene_name, annotation_group, molfct_group,reactome_group) %>% 
+  group_by(gene_name) %>% 
+  slice(1) %>% 
+  ungroup()
+```
+
+- extra code
+```{r}
+############################
+HPA_tab_reform <- HPA_tab %>% 
+  group_by(gene) %>%
+  summarise(tissues = paste(unique(Category), collapse = ", ")) %>%
+  ungroup()
+
+HPA_tab_wide <- HPA_tab %>%
+  group_by(Gene) %>%
+  mutate(row = row_number()) %>%  # Create a row identifier
+  pivot_wider(names_from = row, values_from = Category, names_prefix = "tissue_") %>%
+  ungroup()
+HPA_tab_wide
+##########################################################################################
+```
+
+```{r}
+tissue_fin_toptab <- limma_toptab %>% arrange(logFC) %>%  filter(P.Value <= 0.05 & abs(logFC) > 0.5)
+tissue_fin_toptab %<>%  mutate(Cancer = if_else(logFC > 0, "Cancer", "Healthy"))
+tissue_fin_toptab
+
+# CHANGE ME 
+HPA_tab <- tissue.tab
+# dim(tissue_fin_toptab)
+# tissue_toptab <- tissue_fin_toptab %>% left_join(HPA_tab, by = c("Gene"="Gene"))
+# tissue_toptab %>% names()
+# tissue_toptab %<>% 
+#   mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+#          tissue = if_else(is.na(tissue), "Not mapped", tissue))
+# 
+# wide_tissue_toptab <- tissue_toptab %>% dplyr::select(t,Gene,Cancer,tissue) %>% 
+#     pivot_wider(names_from = tissue , values_from = tissue, values_fill = NA)
+# 
+# wide_tissue_mat <- wide_tissue_toptab %>% column_to_rownames("Gene") %>% dplyr::select(-c(t,Cancer)) %>% as.matrix()
+```
+
+
+
+```{r}
+Phip_seq_R3_a$Gene <-  rownames(Phip_seq_R3_a)
+
+Phip_seq_R3_a %<>% 
+  filter(Gene %in% c(limma_toptab %>% pull(Gene))) %>% 
+  left_join(HPA_tab, by = "Gene") %>% 
+  mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+         tissue = if_else(is.na(tissue), "Not mapped", tissue))
+
+
+limma_toptab %<>% mutate(Cancer = if_else(logFC > 0, "Cancer", "Healthy"))
+top_100_genes_R2_R3 <- limma_toptab %>% arrange(P.Value) %>% 
+  filter(Gene %in% limma_genes) %>% 
+  filter(!grepl("LOC",Gene)) %>% 
+  filter(logFC > 0.5) %>% head(100) %>% pull(Gene)
+
+long_dff <- Phip_seq_R3_a %>% gather(key = "Sample", value = "Expression", 
+                               names(Phip_seq_R3_a[, !names(Phip_seq_R3_a) %in% "Gene"]))
+
+long_dff <- long_dff %>%  
+  filter(Sample %in% colnames(matrix_phip) & Gene %in% c(top_100_genes_R2_R3))
+
+
+long_dff %<>% left_join(filt_limma_toptab %>% dplyr::select(Gene,Cancer), by = "Gene")
+
+long_dff %<>% left_join(HPA_tab, by = "Gene")
+
+long_dff %<>% mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+         tissue = if_else(is.na(tissue), "Not mapped", tissue))
+long_dff$Category %>% unique()
+
+long_dff %<>% mutate(Expression = as.numeric(Expression))
+
+# Step 1: Combine multiple category values into a single column separated by ";"
+df_combined <- long_dff %>% filter(Category != "Not mapped") %>% 
+   mutate(Category = if_else(abs(Expression) < 2, "", Category)) %>% 
+  group_by(Gene, Sample) %>% 
+  summarize(Category = paste(unique(Category), collapse = ";"), .groups = 'drop')
+
+# Step 2: Pivot the table to a wider format
+df_wide <- df_combined %>%
+  pivot_wider(
+    names_from = Sample,     # Sample column as the new column names
+    values_from = Category   # Values filled from the combined Category column
+  )
+
+matrix_JA <- df_wide %>% column_to_rownames("Gene") %>% as.matrix()
+dim(matrix_JA)
+
+
+matrix_JA <- long_dff %>%   filter(Category != "Not mapped") %>% 
+  group_by(Gene, Sample) %>% 
+  summarize(Category = paste(unique(Category), collapse = ";"), .groups = 'drop') %>% column_to_rownames("Gene") %>% as.matrix()
+
+
+meta_JA <- long_dff %>% mutate(Category = if_else(abs(Expression) < 1, "", Category)) %>% 
+  dplyr::select(Gene,Sample,Category ) %>% 
+  filter(Category != "Not mapped") %>% 
+  pivot_wider(
+    names_from = Sample,     # Sample column as the new column names
+    values_from = Category     # Values filled from the tissue column
+  )
+
+meta_JA <- df_wide %>% left_join(HPA_tab, by = "Gene") %>% 
+   mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+         tissue = if_else(is.na(tissue), "Not mapped", tissue))
+```
+
+# my attempt oncoprint
+### 1 cellular structures
+```{r}
+# Extend the color vector with missing categories and assign colors
+col <- c(
+  "Not mapped" = "#d3d3d3",            # Light gray for not mapped
+  "Nucleoplasm" = "#1f78b4",           # Blue
+  "Mitochondria" = "#33a02c",          # Green
+  "Actin filaments" = "#e31a1c",       # Red
+  "Vesicles" = "#ff7f00",              # Orange
+  "Plasma membrane" = "#6a3d9a",       # Purple
+  "Centrosome" = "#b15928",            # Brown
+  "Golgi apparatus" = "#a6cee3",       # Light blue
+  "Nuclear bodies" = "#fb9a99",        # Pink
+  "Cytosol" = "#b2df8a",               # Light green
+  "Nucleoli" = "#fdbf6f",              # Light orange
+  "Focal adhesion sites" = "#cab2d6",  # Light purple
+  "Nuclear speckles" = "#ffff99",      # Yellow
+  "Nucleoli fibrillar center" = "#1f78b4",  # Blue (same as Nucleoplasm)
+  "Microtubules" = "#33a02c",          # Green (same as Mitochondria)
+  "Intermediate filaments" = "#e31a1c",# Red (same as Actin filaments)
+  "Centriolar satellite" = "#6a3d9a",  # Purple (same as Plasma membrane)
+  "Endoplasmic reticulum" = "#ff7f00", # Orange (same as Vesicles)
+  "Cell Junctions" = "#b15928",        # Brown (same as Centrosome)
+  "Cytoplasmic bodies" = "#a6cee3",    # Light blue (same as Golgi apparatus)
+  "Nuclear membrane" = "#fb9a99",      # Pink (same as Nuclear bodies)
+  "Lipid droplets" = "#b2df8a",        # Light green (same as Cytosol)
+  "Midbody" = "#fdbf6f",               # Light orange (same as Nucleoli),
+  "Aggresome" = "#ff6347",             # Tomato red for Aggresome
+  "Endosomes" = "#4682b4",             # Steel blue for Endosomes
+  "Mitotic chromosome" = "#ff4500",    # Orange red for Mitotic chromosome
+  "Nucleoli rim" = "#deb887",          # Burlywood for Nucleoli rim
+  "Cytokinetic bridge" = "#8b4513",    # Saddle brown for Cytokinetic bridge
+  "Peroxisomes" = "#7fffd4"            # Aquamarine for Peroxisomes
+)
+
+# Extend the alter_fun list with missing categories
+alter_fun <- list(
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  
+  # Existing alterations
+  `Not mapped` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Not mapped"], col = NA)) },
+  Nucleoplasm = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nucleoplasm"], col = NA)) },
+  Mitochondria = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Mitochondria"], col = NA)) },
+  `Actin filaments` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h*0.33, gp = gpar(fill = col["Actin filaments"], col = NA)) },
+  Vesicles = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Vesicles"], col = NA)) },
+  `Plasma membrane` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Plasma membrane"], col = NA)) },
+  Centrosome = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Centrosome"], col = NA)) },
+  `Golgi apparatus` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Golgi apparatus"], col = NA)) },
+  `Nuclear bodies` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nuclear bodies"], col = NA)) },
+  Cytosol = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cytosol"], col = NA)) },
+  Nucleoli = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nucleoli"], col = NA)) },
+  `Focal adhesion sites` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Focal adhesion sites"], col = NA)) },
+  `Nuclear speckles` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nuclear speckles"], col = NA)) },
+  `Nucleoli fibrillar center` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nucleoli fibrillar center"], col = NA)) },
+  Microtubules = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Microtubules"], col = NA)) },
+  `Intermediate filaments` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h*0.33, gp = gpar(fill = col["Intermediate filaments"], col = NA)) },
+  `Centriolar satellite` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Centriolar satellite"], col = NA)) },
+  `Endoplasmic reticulum` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Endoplasmic reticulum"], col = NA)) },
+  `Cell Junctions` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cell Junctions"], col = NA)) },
+  `Cytoplasmic bodies` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cytoplasmic bodies"], col = NA)) },
+  `Nuclear membrane` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nuclear membrane"], col = NA)) },
+  `Lipid droplets` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Lipid droplets"], col = NA)) },
+  Midbody = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Midbody"], col = NA)) },
+  
+  # Newly added categories
+  Aggresome = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Aggresome"], col = NA)) },
+  Endosomes = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Endosomes"], col = NA)) },
+  `Mitotic chromosome` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Mitotic chromosome"], col = NA)) },
+  `Nucleoli rim` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nucleoli rim"], col = NA)) },
+  `Cytokinetic bridge` = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cytokinetic bridge"], col = NA)) },
+  Peroxisomes = function(x, y, w, h) { grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Peroxisomes"], col = NA)) }
+)
+
+# Use this updated alter_fun and col in your ComplexHeatmap function as needed
+
+```
+
+### 2 cellular categories
+```{r}
+# Define colors for each category
+col <- c(
+  # "Not mapped" = "#d3d3d3",                            # Light gray
+  "Cytoplasm and Associated Structures" = "#1f78b4",  # Blue
+  "Nucleus and Nuclear Structures" = "#33a02c",       # Green
+  "Organelles" = "#e31a1c",                           # Red
+  "Membrane-associated Structures" = "#ff7f00",       # Orange
+  "Cytoskeleton" = "#6a3d9a"                          # Purple
+)
+# Create the alter_fun list for each category
+alter_fun <- list(
+  # Default background
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  
+  # Not mapped
+  `Not mapped` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Not mapped"], col = NA))
+  },
+  
+  # Cytoplasm and Associated Structures
+  `Cytoplasm and Associated Structures` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cytoplasm and Associated Structures"], col = NA))
+  },
+  
+  # Nucleus and Nuclear Structures
+  `Nucleus and Nuclear Structures` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Nucleus and Nuclear Structures"], col = NA))
+  },
+  
+  # Organelles
+  Organelles = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Organelles"], col = NA))
+  },
+  
+  # Membrane-associated Structures
+  `Membrane-associated Structures` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Membrane-associated Structures"], col = NA))
+  },
+  
+  # Cytoskeleton
+  Cytoskeleton = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), gp = gpar(fill = col["Cytoskeleton"], col = NA))
+  }
+)
+
+```
+
+### 3 tissue categories
+```{r}
+# Define colors for each category
+col <- c(
+  "Not mapped" = "#d3d3d3",                   # Light gray
+  "Nervous System - Central" = "#1f78b4",     # Blue
+  "Digestive System" = "#33a02c",             # Green
+  "Reproductive System - Female" = "#e31a1c", # Red
+  "Respiratory System" = "#ff7f00",           # Orange
+  "Integumentary System" = "#6a3d9a",         # Purple
+  "Reproductive System - Male" = "#b15928",   # Brown
+  "Immune and Lymphatic System" = "magenta",  # magenta
+  "Endocrine System" = "#fb9a99",             # Pink
+  "Urinary System" = "#b2df8a",               # Light green
+  "Musculoskeletal System" = "#fdbf6f",       # Light orange
+  "Nervous System - Peripheral" = "#cab2d6",   # Light purple
+  "NA" = "white"
+)
+
+library(grid)
+
+# Create the alter_fun list for each category
+alter_fun <- list(
+  # Default background function
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  
+  # Not mapped
+  `Not mapped` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Not mapped"], col = NA))
+  },
+  
+  # Nervous System - Central
+  `Nervous System - Central` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Nervous System - Central"], col = NA))
+  },
+  
+  # Digestive System
+  `Digestive System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Digestive System"], col = NA))
+  },
+  
+  # Reproductive System - Female
+  `Reproductive System - Female` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Reproductive System - Female"], col = NA))
+  },
+  
+  # Respiratory System
+  `Respiratory System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Respiratory System"], col = NA))
+  },
+  
+  # Integumentary System
+  `Integumentary System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Integumentary System"], col = NA))
+  },
+  
+  # Reproductive System - Male
+  `Reproductive System - Male` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Reproductive System - Male"], col = NA))
+  },
+  
+  # Immune and Lymphatic System
+  `Immune and Lymphatic System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Immune and Lymphatic System"], col = NA))
+  },
+  
+  # Endocrine System
+  `Endocrine System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Endocrine System"], col = NA))
+  },
+  
+  # Urinary System
+  `Urinary System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Urinary System"], col = NA))
+  },
+  
+  # Musculoskeletal System
+  `Musculoskeletal System` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Musculoskeletal System"], col = NA))
+  },
+  
+  # Nervous System - Peripheral
+  `Nervous System - Peripheral` = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["Nervous System - Peripheral"], col = NA))
+  },
+    # Nervous System - Peripheral
+  "NA" = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = col["NA"], col = NA))
+  }
+)
+
+```
+
+```{r}
+# Create the alter_fun list for each category with offset positions
+alter_fun <- list(
+  # Default background function
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+              gp = gpar(fill = "#CCCCCC", col = NA))
+  },
+  
+  # Not mapped: Top-left corner
+  `Not mapped` = function(x, y, w, h) {
+    grid.rect(x - w * 0.25, y + h * 0.25, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Not mapped"], col = NA))
+  },
+  
+  # Nervous System - Central: Top-right corner
+  `Nervous System - Central` = function(x, y, w, h) {
+    grid.rect(x + w * 0.25, y + h * 0.25, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Nervous System - Central"], col = NA))
+  },
+  
+  # Digestive System: Bottom-left corner
+  `Digestive System` = function(x, y, w, h) {
+    grid.rect(x - w * 0.25, y - h * 0.25, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Digestive System"], col = NA))
+  },
+  
+  # Reproductive System - Female: Bottom-right corner
+  `Reproductive System - Female` = function(x, y, w, h) {
+    grid.rect(x + w * 0.25, y - h * 0.25, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Reproductive System - Female"], col = NA))
+  },
+  
+  # Respiratory System: Center
+  `Respiratory System` = function(x, y, w, h) {
+    grid.rect(x, y, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Respiratory System"], col = NA))
+  },
+  
+  # Integumentary System: Top-center
+  `Integumentary System` = function(x, y, w, h) {
+    grid.rect(x, y + h * 0.35, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Integumentary System"], col = NA))
+  },
+  
+  # Reproductive System - Male: Bottom-center
+  `Reproductive System - Male` = function(x, y, w, h) {
+    grid.rect(x, y - h * 0.35, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Reproductive System - Male"], col = NA))
+  },
+  
+  # Immune and Lymphatic System: Left-center
+  `Immune and Lymphatic System` = function(x, y, w, h) {
+    grid.rect(x - w * 0.35, y, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Immune and Lymphatic System"], col = NA))
+  },
+  
+  # Endocrine System: Right-center
+  `Endocrine System` = function(x, y, w, h) {
+    grid.rect(x + w * 0.35, y, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Endocrine System"], col = NA))
+  },
+  
+  # Urinary System: Top-left inside
+  `Urinary System` = function(x, y, w, h) {
+    grid.rect(x - w * 0.15, y + h * 0.15, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Urinary System"], col = NA))
+  },
+  
+  # Musculoskeletal System: Top-right inside
+  `Musculoskeletal System` = function(x, y, w, h) {
+    grid.rect(x + w * 0.15, y + h * 0.15, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Musculoskeletal System"], col = NA))
+  },
+  
+  # Nervous System - Peripheral: Bottom-left inside
+  `Nervous System - Peripheral` = function(x, y, w, h) {
+    grid.rect(x - w * 0.15, y - h * 0.15, w*0.3, h*0.3, 
+              gp = gpar(fill = col["Nervous System - Peripheral"], col = NA))
+  },
+    # Nervous System - Peripheral: Bottom-left inside
+  "NA" = function(x, y, w, h) {
+    grid.rect(x - w * 0.15, y - h * 0.15, w*0.3, h*0.3, 
+              gp = gpar(fill = col["NA"], col = NA))
+  }
+)
+
+```
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+
+aa <- aa_meta %>% column_to_rownames("cluster")
+# aa[is.na(aa)] <- ""
+
+oncoPrint(aa,
+    alter_fun = alter_fun, col = col,     
+    #column_split = mata_d$Cancer,
+    #row_split = aa_meta$cluster,
+    show_row_names = TRUE, na_col = "white",
+            height = unit(100, "mm"),
+        width = unit(150, "mm"))
+```
+
+# MR PLOT
+```{r}
+colnames(matrix_JA) == meta_phip$strings
+# Create the heatmap with the defined legend parameters
+
+mata_d <- data.frame(strings = colnames(matrix_JA)) %>% left_join(meta_phip, by = "strings")
+
+mel_pts <- mata_d %>% filter(Cancer == "Melanoma") %>% pull(strings)
+HD_pts <- mata_d %>% filter(Cancer == "HD") %>% pull(strings)
+
+mata_d$Cancer
+colnames(matrix_JA) == mata_d$strings
+
+mel_pts_mat <- matrix_JA[, colnames(matrix_JA) %in% mel_pts]
+mel_HD_mat <- matrix_JA[, colnames(matrix_JA) %in% HD_pts]
+
+
+h1 <- oncoPrint(mel_pts_mat,
+    alter_fun = alter_fun, col = col,     
+    #column_split = mata_d$Cancer,
+    #row_split = meta_JA$Category,
+    show_row_names = TRUE,
+            height = unit(150, "mm"),
+        width = unit(75, "mm"))
+
+h2 <- oncoPrint(mel_HD_mat,
+    alter_fun = alter_fun, col = col,     
+    #column_split = mata_d$Cancer,
+    #row_split = meta_JA$Category,
+    show_row_names = TRUE,
+            height = unit(150, "mm"),
+        width = unit(75, "mm"))
+
+h1+h2
+```
+
+
+
+```{r}
+tabbb %>% add_row("Not mapped")
+
+rbind(
+  tabbb,
+  data.frame(Gene = "Not mapped", Category = "Not mapped")
+)
+
+
+setdiff(colnames(wide_tissue_mat), tabbb$tissue)
+
+wide_tissue_mat %>% dim()
+wide_tissue_toptab %>% dplyr::select(Gene) %>% left_join(tissue.tab %>% dplyr::select(Gene, Category), by = "Gene") 
+wide_tissue_toptab
+wide_tissue_mat
+tabbb <- distinct(tissue.tab[,-1])
+
+# Create a row annotation for the heatmap based on the Category
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Category = tissues_tbl$Category
+)
+
+row_anno_2 <- ComplexHeatmap::rowAnnotation(
+  Category = tissues_tbl$Tissues
+)
+
+Response_anno = ComplexHeatmap::rowAnnotation(Response = Phip_mx_df$Response,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F,
+                        col = list(Response = c(colors_LHB$Response)))
+################
+
+ComplexHeatmap::Heatmap(t(my.df_mat),
+        cluster_columns  = T, 
+        cluster_rows  = T,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        row_gap = unit(1, "mm"),
+        column_title = "expression",
+        height = unit(100, "mm"),
+        width = unit(150, "mm"),
+        left_annotation = c(row_anno),
+        column_split = my.df$Cancer,
+        #row_split = colnames(my.df_mat),
+        column_labels = T)
+```
+
+
+
+# GOOD Plots
+```{r}
+tissue_fin_toptab <- fin_toptab
+tissue_fin_toptab %<>%  mutate(Cancer = if_else(logFC > 0, "Cancer", "Healthy"))
+tissue_fin_toptab
+
+# CHANGE ME 
+HPA_tab <- cell.location.tbl
+dim(tissue_fin_toptab)
+tissue_toptab <- tissue_fin_toptab %>% left_join(HPA_tab, by = c("Gene"="Gene"))
+tissue_toptab %<>% 
+  mutate(Category = if_else(is.na(Category), "Not mapped", Category),
+         cellular_location = if_else(is.na(cellular_location), "Not mapped", cellular_location))
+
+tissue_toptab$Category <- factor(tissue_toptab$Category, levels = c("Membrane-associated Structures", 
+                                              "Cytoplasm and Associated Structures",
+                                              "Cytoskeleton",
+                                              "Organelles",
+                                              "Nucleus and Nuclear Structures",
+                                              "Not mapped"))
+
+tissue_toptab %>%
+  mutate(Cancer = if_else(logFC > 0, "Melanoma", "HD")) %>% 
+  #filter(!is.na(cellular_location)) %>% 
+  group_by(Cancer,cellular_location,Category) %>%
+  dplyr::count() %>% filter(n >= 1) %>% 
+  ggplot(aes(x = fct_reorder(cellular_location,n), y = n)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Tissue", y = "Count", title = "Counts of Each Tissue Type") +
+  theme_bw() +
+  guides(fill = guide_legend(title = "LogFC")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title = element_text(size = 15)) +
+  theme(axis.text.x = element_blank(), #element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.ticks.x = element_blank(),  # Remove x-axis ticks
+        strip.text.x = element_text(angle = 0,size = 18),  # Set right facet strip to horizontal
+         strip.text.y = element_text(angle = 0,size = 12),  # Set right facet strip to horizontal
+        strip.background = element_rect(fill = "white", color = "white"),  # White background for facet labels and no border
+        panel.background = element_rect(fill = "white"),  # Make panels white
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_grid(Category ~ Cancer, scales = "free_y", space = "free_y")+ coord_flip()
+  #facet_grid(Category ~ Cancer, scales = "free_y", space = "free_y") +
+
+# select top genes to plot 
+top_genes_plots <- tissue_toptab %>% dplyr::select(Gene,t,P.Value) %>% distinct() %>% 
+  arrange(P.Value) #%>% head(150)
+tissue_toptab$cellular_location
+
+# Summarize the data to get the average or max 't' value for each gene
+gene_order <- tissue_toptab %>%
+  filter(Gene %in% top_genes_plots$Gene) %>%
+  group_by(Gene) %>%
+  summarize(avg_t = mean(t, na.rm = TRUE)) %>%
+  arrange(desc(avg_t)) %>%
+  pull(Gene)
+
+tissue_order <- tissue_toptab %>%
+  filter(!is.na(cellular_location)) %>%
+  group_by(cellular_location) %>%
+  dplyr::count() %>%
+  filter(n > 0) %>%
+  
+  arrange(desc(n)) %>%
+  pull(cellular_location)
+
+# Create the plot with reordered tissues and genes based on counts
+tissue_toptab %>%
+  filter(Gene %in% top_genes_plots$Gene) %>%
+    ggplot(aes(fct_reorder(Gene, match(Gene, gene_order)), cellular_location)) + 
+  # ggplot(aes(fct_reorder(cellular_location, match(cellular_location, tissue_order)), Gene)) + 
+  geom_tile(aes(fill = t)) +
+  scale_fill_gradientn(breaks = c(min(top_genes_plots$t), 0, max(top_genes_plots$t)), colors = c("blue", "grey50", "orange")) +
+  labs(x = 'Tissue', y = 'Gene') +
+  theme_bw() +
+  guides(fill = guide_legend(title = "LogFC")) +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title = element_text(size = 15)) +
+  theme(axis.text.x = element_blank(), #element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.ticks.x = element_blank(),  # Remove x-axis ticks
+        strip.text.x = element_text(angle = 0,size = 18),  # Set right facet strip to horizontal
+         strip.text.y = element_text(angle = 0,size = 12),  # Set right facet strip to horizontal
+        strip.background = element_rect(fill = "white", color = "white"),  # White background for facet labels and no border
+        panel.background = element_rect(fill = "white"),  # Make panels white
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_grid(Category ~ Cancer, scales = "free", space = "free")
+
+
+tissue_toptab_wide <- tissue_toptab %>% dplyr::select(logFC,Gene,Cancer,cellular_location) %>% 
+  distinct() %>%  # Ensure unique gene-tissue pairs
+  pivot_wider(names_from = cellular_location , values_from = logFC, values_fill = NA)
+
+tissue_toptab$Gene_Cell_location <- paste(tissue_toptab$Gene, tissue_toptab$cellular_location, sep = "_")
+#tissue_toptab %<>% filter(tissue_combined %in% top_tissues)
+
+# HEATMAP PATIENT INFO
+######################################
+# Subset the dataframe using rownames in all_row_names
+sub_df <- matrix_phip[rownames(matrix_phip) %in% tissue_toptab$Gene, ]
+
+sub_df_long <- sub_df %>%
+  pivot_longer(cols = colnames(sub_df), 
+               names_to = "strings",  # Name for the column that stores original column names
+               values_to = "expression")  # Name for the column that stores data values
+
+sub_df_long %<>% left_join(PHIPseq_list$df_Phip_metadata, by = "strings")
+sub_df_long_meta <- sub_df_long %>% dplyr::select(-expression) %>% distinct() %>% column_to_rownames("strings")
+
+colnames(sub_df) == rownames(sub_df_long_meta)
+sub_df_mat <- as.matrix(sub_df)
+nrow(sub_df_mat)
+sub_df$Gene <- rownames(sub_df)
+sub_df %<>% left_join(tissue_toptab, by = "Gene")
+sub_df %>% filter(!is.na(Category)) %>% dim()
+sub_df %>% distinct(Gene) %>% nrow()
+
+library(circlize)
+library(grid)
+
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Category = anno_text(
+    sub_df$Category,  # Assuming sub_df has the 'Category' column for annotation labels
+    rot = 90          # Rotate the labels 90 degrees
+  )
+)
+
+Response_anno = ComplexHeatmap::columnAnnotation(Response = sub_df_long_meta$Response,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F,
+                        col = list(Response = c(colors_LHB$Response)))
+
+ComplexHeatmap::Heatmap(sub_df_mat,
+        cluster_columns  = T, 
+        row_title_rot = 0,
+        cluster_rows  = T,
+        cluster_row_slices = FALSE,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        row_gap = unit(1, "mm"),
+        column_title = "expression",
+        width = unit(75, "mm"),
+        height = unit(125, "mm"),
+        top_annotation = Response_anno,
+        column_split = sub_df_long_meta$Cancer,
+        left_annotation = c(row_anno),
+        row_split = sub_df$Category,
+        column_labels = T)
+
+
+
+# HEATMAP TISSUE EXPRESSION PATTERNS
+######################################
+
+library(oncoprint)
+BiocManager::install("oncoprint")
+
+
+
+full_tab <- tissue_toptab %>% dplyr::select(-c(logFC:B)) %>% left_join(sub_df, by = "Gene")
+
+rownames(full_tab) <-  full_tab$Gene_Tissue
+
+heat_mat <- full_tab %>% dplyr::select(matches("HC|HD|pt_")) %>% as.matrix()
+dim(heat_mat)
+meta_phip %>% dim()
+
+
+tissue_toptab
+
+my.df <- tissue_toptab_wide %>% as.data.frame() %>% column_to_rownames("Gene")
+my.df_mat <- my.df %>%  dplyr::select(-Cancer,-"NA") %>% as.matrix()
+my.df_mat[is.na(my.df_mat)] <- 0
+keep <- abs(rowSums(my.df_mat)) > 0
+my.df_mat <- my.df_mat[keep,]
+my.df_mat <- abs(my.df_mat)
+
+sub_df <- my.df[rownames(my.df) %in% rownames(my.df_mat), ]
+dim(sub_df)
+
+meta_phip %>% dim()
+
+################
+# Create a row annotation for the heatmap based on the Category
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Category = tissues_tbl$Category
+)
+
+row_anno_2 <- ComplexHeatmap::rowAnnotation(
+  Category = tissues_tbl$Tissues
+)
+
+Response_anno = ComplexHeatmap::rowAnnotation(Response = Phip_mx_df$Response,
+                        simple_anno_size = unit(c(0.4), "cm"),
+                    gap = unit(c(1,1), "mm"), annotation_name_gp= gpar(fontsize = 14),
+                     show_annotation_name = F,
+                        col = list(Response = c(colors_LHB$Response)))
+################
+
+ComplexHeatmap::Heatmap(t(my.df_mat),
+        cluster_columns  = T, 
+        cluster_rows  = T,
+        show_column_names = FALSE,
+        show_row_names = FALSE,
+        row_gap = unit(1, "mm"),
+        column_title = "expression",
+        height = unit(100, "mm"),
+        width = unit(150, "mm"),
+        left_annotation = c(row_anno),
+        column_split = my.df$Cancer,
+        #row_split = colnames(my.df_mat),
+        column_labels = T)
+
+data.frame(Tissues = colnames(my.df_meta)) %>%  left_join(tissues_tbl, by = "Tissues") 
+
+##########################################################################################
+
+
+
+
+
+intersect(HPA_tab_reform$gene,filt_toptab_genne_anno$Gene)
+
+tab_x <- filt_toptab_genne_anno %>%
+  left_join(HPA_wide %>% 
+              dplyr::select(`Gene name`, Tissue,`Cell type`), by = c("Gene" = "Gene name")) %>%
+  mutate(tissue_expr = coalesce(Tissue, NA)) %>% distinct() %>% 
+  dplyr::select(-Tissue)  # Optionally remove the extra 'Tissue' column if you don't need it
+tab_x %>%  filter(is.na(tissue_expr))
+tab_x %>% nrow()
+
+
+tissue_list <- list()
+tissue_list <- downloadedData$normal_tissue$tissue %>% unique()
+View(data)
+
+hpaVis(downloadedData,
+       targetGene = c("GCH1", "PTS", "SPR", "DHFR"),
+       targetTissue = c("cerebellum", "cerebral cortex", "hippocampus"),
+       targetCancer = c("glioma"))
+
+filt_toptab_genne_anno %>%  mutate(Cancer = if_else(logFC > 0, "Melanoma", "HD"))
+hpaVisTissue(downloadedData,
+             targetGene= grep("LOC",filt_toptab_genne_anno$Gene, value = T,invert = TRUE),
+             targetTissue= tissue_list)
+```
+
+
+
+# Oncoprint
+```{r}
+mat = read.table(textConnection(
+                "s1,s2,s3
+                g1,snv;indel,snv,indel
+                g2,,snv;indel,snv
+                g3,snv,,indel;snv"), 
+                row.names = 1, header = TRUE, sep = ",", stringsAsFactors = FALSE)
+mat = as.matrix(mat)
+mat
+```
+
+```{r}
+get_type_fun = function(x) strsplit(x, ";")[[1]]
+get_type_fun(mat[1, 1])
+```
+
+```{r}
+mat[1, 1]
+get_type_fun(mat[1, 1])
+```
+
+```{r}
+library(ComplexHeatmap)
+oncoPrint(mat)
+
+col = c(snv = "yellow", indel = "purple")
+oncoPrint(mat,
+    alter_fun = list(
+        snv = function(x, y, w, h) grid.rect(x*0.999, y, w*0.9, h*0.9, 
+            gp = gpar(fill = col["snv"], col = "black")),
+        
+        indel = function(x, y, w, h) grid.rect(x, y, w*0.9, h*0.4, 
+            gp = gpar(fill = col["indel"], col = "green"))), 
+    col = col,
+    alter_fun_is_vectorized = FALSE)
+```
+# Chapter 2 - Using oncoprint in real life
+
+Requirements of input data 
+```{r}
+mat = read.table(system.file("extdata", package = "ComplexHeatmap", 
+    "tcga_lung_adenocarcinoma_provisional_ras_raf_mek_jnk_signalling.txt"), 
+    header = TRUE, stringsAsFactors = FALSE, sep = "\t")
+mat[is.na(mat)] = ""
+rownames(mat) = mat[, 1]
+mat = mat[, -1]
+mat=  mat[, -ncol(mat)]
+mat = t(as.matrix(mat))
+
+mat[1:10, 1:10]
+```
+making the alter_fun structure 
+```{r}
+col = c("HOMDEL" = "blue", "AMP" = "red", "MUT" = "#008000")
+
+alter_fun = list(
+    background = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = "#CCCCCC", col = NA))
+    },
+    # big blue
+    HOMDEL = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = col["HOMDEL"], col = NA))
+    },
+    # big red
+    AMP = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = col["AMP"], col = NA))
+    },
+    # small green
+    MUT = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h*0.33, 
+            gp = gpar(fill = col["MUT"], col = NA))
+    }
+)
+```
+
+
+```{r}
+column_title = "OncoPrint for TCGA Lung Adenocarcinoma, genes in Ras Raf MEK JNK signalling"
+
+heatmap_legend_param = list(title = "Alternations", at = c("HOMDEL", "AMP", "MUT"), 
+        labels = c("Deep deletion", "Amplification", "Mutation"))
+```
+
+
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+    
+#You can pass Heatmap() arguments in oncoPrint 
+```
+Removing empty col and rows
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+```{r}
+sample_order = scan(paste0(system.file("extdata", package = "ComplexHeatmap"), 
+    "/sample_order.txt"), what = "character")
+
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    row_order = 1:nrow(mat), column_order = sample_order,
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    top_annotation = HeatmapAnnotation(
+        column_barplot = anno_oncoprint_barplot("MUT", border = TRUE, # only MUT
+            height = unit(4, "cm"))
+    ),
+    right_annotation = rowAnnotation(
+        row_barplot = anno_oncoprint_barplot(c("AMP", "HOMDEL"),  # only AMP and HOMDEL
+            border = TRUE, height = unit(4, "cm"), 
+            axis_param = list(side = "bottom", labels_rot = 90))
+    ),
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+```
+oncoprint produce heatmap object, you can add them vertically or horizontally directly
+```{r}
+ht1 <- oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    top_annotation = HeatmapAnnotation(
+        column_barplot = anno_oncoprint_barplot("MUT", border = TRUE, # only MUT
+            height = unit(4, "cm"))
+    ),
+    right_annotation = rowAnnotation(
+        row_barplot = anno_oncoprint_barplot(c("AMP", "HOMDEL"),  # only AMP and HOMDEL
+            border = TRUE, height = unit(4, "cm"), 
+            axis_param = list(side = "bottom", labels_rot = 90))
+    ),
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+
+
+ht1 + ht1 
+```
+
+
+```{r}
+# oncoPrint(mat,
+#     alter_fun = alter_fun, col = col, 
+#     column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+# 
+# oncoPrint(mat,
+#     alter_fun = alter_fun, col = col, 
+#     column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+#     column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+
+
+```
+
+
+```{r}
+colnames(wide_tissue_mat)
+wide_tissue_toptab
+wide_tissue_mat
+wide_tissue_mat[is.na(wide_tissue_mat)] <- ""
+
+oncoPrint(wide_tissue_mat)
+```
+
+```{r}
+mat = read.table(system.file("extdata", package = "ComplexHeatmap", 
+    "tcga_lung_adenocarcinoma_provisional_ras_raf_mek_jnk_signalling.txt"), 
+    header = TRUE, stringsAsFactors = FALSE, sep = "\t")
+mat[is.na(mat)] = ""
+rownames(mat) = mat[, 1]
+mat = mat[, -1]
+mat=  mat[, -ncol(mat)]
+mat = t(as.matrix(mat))
+
+mat[1:10, 1:10]
+```
+
+making the alter_fun structure 
+```{r}
+col = c("HOMDEL" = "blue", "AMP" = "red", "MUT" = "#008000")
+
+alter_fun = list(
+    background = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = "#CCCCCC", col = NA))
+    },
+    # big blue
+    HOMDEL = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = col["HOMDEL"], col = NA))
+    },
+    # big red
+    AMP = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h-unit(2, "pt"), 
+            gp = gpar(fill = col["AMP"], col = NA))
+    },
+    # small green
+    MUT = function(x, y, w, h) {
+        grid.rect(x, y, w-unit(2, "pt"), h*0.33, 
+            gp = gpar(fill = col["MUT"], col = NA))
+    }
+)
+```
+
+
+```{r}
+column_title = "OncoPrint for TCGA Lung Adenocarcinoma, genes in Ras Raf MEK JNK signalling"
+
+heatmap_legend_param = list(title = "Alternations", at = c("HOMDEL", "AMP", "MUT"), 
+        labels = c("Deep deletion", "Amplification", "Mutation"))
+```
+
+
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+    
+#You can pass Heatmap() arguments in oncoPrint 
+```
+Removing empty col and rows
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+```{r}
+sample_order = scan(paste0(system.file("extdata", package = "ComplexHeatmap"), 
+    "/sample_order.txt"), what = "character")
+
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    row_order = 1:nrow(mat), column_order = sample_order,
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param)
+```
+```{r}
+oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    top_annotation = HeatmapAnnotation(
+        column_barplot = anno_oncoprint_barplot("MUT", border = TRUE, # only MUT
+            height = unit(4, "cm"))
+    ),
+    right_annotation = rowAnnotation(
+        row_barplot = anno_oncoprint_barplot(c("AMP", "HOMDEL"),  # only AMP and HOMDEL
+            border = TRUE, height = unit(4, "cm"), 
+            axis_param = list(side = "bottom", labels_rot = 90))
+    ),
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+```
+oncoprint produce heatmap object, you can add them vertically or horizontally directly
+```{r}
+ht1 <- oncoPrint(mat,
+    alter_fun = alter_fun, col = col, 
+    top_annotation = HeatmapAnnotation(
+        column_barplot = anno_oncoprint_barplot("MUT", border = TRUE, # only MUT
+            height = unit(4, "cm"))
+    ),
+    right_annotation = rowAnnotation(
+        row_barplot = anno_oncoprint_barplot(c("AMP", "HOMDEL"),  # only AMP and HOMDEL
+            border = TRUE, height = unit(4, "cm"), 
+            axis_param = list(side = "bottom", labels_rot = 90))
+    ),
+    remove_empty_columns = TRUE, remove_empty_rows = TRUE,
+    column_title = column_title, heatmap_legend_param = heatmap_legend_param,
+    column_title_gp = gpar(fontsize = 9, fontface = "bold"))
+
+
+ht1 + ht1 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+what are the membrane genes
+
+```{r}
+head(downloadedData$subcellular_location)
+
+table(downloadedData$subcellular_location$main_location) %>% 
+  sort()
+
+memberane_genes<- downloadedData$subcellular_location %>% 
+  filter(str_detect(main_location, "Plasma membrane")) 
+
+inner_join(data, memberane_genes, by = c("ensembl" = "ensembl")) 
+```
+
+
+Make a heatmap 
+
+```{r}
+library(ComplexHeatmap)
+
+data2<- data %>% 
+  filter(gene %in% memberane_genes$gene)
+
+mat<- as.matrix(data2[, -c(1,2,3)])
+rownames(mat)<- data2$gene
+
+ComplexHeatmap::Heatmap(mat,
+                        show_row_names = FALSE,
+                        show_column_names = FALSE)
+```

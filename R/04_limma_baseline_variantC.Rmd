@@ -1,0 +1,452 @@
+---
+title: "Autoantidoby manuscript (Baseline analyses)"
+output: html_document
+date: "2024-09-20"
+editor_options: 
+  chunk_output_type: console
+---
+
+- in this script I will apply limma model to determine which auto-abs are enrichned in Melanoma vs HD samples
+at baseline.
+- I will perform differential gene expression
+- visualizations: volcano plots, counts 
+
+# Paths/libraries/source code
+```{r}
+# ---- Project setup: paths, packages, colours/themes ----------------------
+# Replaces the original machine-specific absolute paths and the two lost
+# source files (autoantibody_libraries.R, LHB_color_tools.R). setup.R defines
+# file_path, data_path, results_path and loads all packages + figure themes.
+if (file.exists("setup.R")) source("setup.R") else source(file.path("R", "setup.R"))
+```
+
+# read PHIPseq_list
+```{r}
+PHIPseq_list <-  readRDS(paste0(data_path, "PHIPseq_list.Rda"))
+```
+
+### select subjects
+```{r}
+PHIPseq_list$df_Phip_metadata$Vac_cycle %>% unique()
+d0_pts_HDs <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_0") %>% pull(strings)
+d0_pts <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_0" & Outcome != "HD") %>% pull(strings)
+d43_pts <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_43") %>% pull(strings)
+d89_pts <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_89_101") %>% pull(strings)
+d43_pts_Good <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_43" & Outcome == "Good") %>% pull(strings)
+d43_pts_Bad <- PHIPseq_list$df_Phip_metadata %>% filter(Vac_cycle == "day_43" & Outcome == "Bad") %>% pull(strings)
+```
+
+# --------------
+# limma model 
+
+# define matrix of interest
+```{r}
+# Define a function to subset and format matrix and metadata
+prepare_phip_data <- function(data_name, phip_list, pts) {
+  # Subset the matrix based on the input dataset name and patients of interest
+  matrix_phip <- phip_list[[data_name]] %>% 
+    dplyr::select(all_of(intersect(pts, colnames(phip_list[[data_name]]))))
+  
+  # Subset the metadata to match the columns of the matrix
+  meta_phip <- phip_list$df_Phip_metadata %>% 
+    filter(strings %in% colnames(matrix_phip))
+  
+  # Set the row names of the metadata to match the column names of the matrix
+  rownames(meta_phip) <- meta_phip$strings
+  
+  # Return the matrix and metadata as a list
+  list(matrix = matrix_phip, metadata = meta_phip)
+}
+
+# use of the function and CHOOSE dtaaset
+phip_data <- prepare_phip_data("Phip_seq_R3_rpk", PHIPseq_list, c(d0_pts,d43_pts,d89_pts))
+
+# Accessing the resulting matrix and metadata
+matrix_phip <- phip_data$matrix
+meta_phip <- phip_data$metadata
+dim(meta_phip)
+####################
+# Check if column names of matrix_phip match row names of meta_phip
+if (all(colnames(matrix_phip) == rownames(meta_phip))) {
+  print("The column names of matrix_phip match the row names of meta_phip.")
+} else if (setequal(colnames(matrix_phip), rownames(meta_phip))) {
+  print("The column names are the same but in different order. Reordering meta_phip...")
+  meta_phip <- meta_phip[colnames(matrix_phip), ]
+  print("meta_phip has been reordered to match column names of matrix_phip.")
+} else {
+  print("The column names do not match the row names of meta_phip. No action taken.")
+}
+
+####################
+meta_phip$Outcome <- factor(meta_phip$Outcome, levels=c("Good","Bad"))
+meta_phip$Cancer <- factor(meta_phip$Cancer, levels=c("Melanoma","HD"))
+meta_phip$Vac_cycle <- factor(meta_phip$Vac_cycle, levels = c("day_0","day_43","day_89_101"))
+####################
+
+meta_phip %>% dplyr::select(Outcome,Vac_cycle)
+meta_phip$Out_cycle <- factor(paste(meta_phip$Outcome,meta_phip$Vac_cycle,sep="_")) 
+```
+
+
+
+```{r}
+# Outcome vs vaccine cycle design  
+design <- model.matrix(~0 + Out_cycle, data = meta_phip)
+colnames(design) <- levels(meta_phip$Out_cycle)
+
+contrast_matrix <- makeContrasts(
+  Bad_day_43_vs_Bad_day_0 = Bad_day_43 - Bad_day_0,
+  Good_day_43_vs_Good_day_0 = Good_day_43 - Good_day_0,
+  levels = design
+)
+
+# Assuming `matrix_phip` is your data matrix with genes/proteins as rows and samples as columns
+# log transformation of the data
+log_rpk <- log2(matrix_phip + 0.01)  # Adding 0.01 to avoid log(0)
+# Fit the linear model to the log-transformed data
+vfit <- lmFit(log_rpk, design)
+# Apply the contrast matrix
+vfit <- contrasts.fit(vfit, contrast_matrix)
+# Perform empirical Bayes smoothing to the standard errors
+efit <- eBayes(vfit)
+# Extract the top table with all results
+
+top_tables_list <- list()
+
+# Loop through each contrast and extract top tables
+for (contrast_name in colnames(contrast_matrix)) {
+  # Extract top table for the current contrast
+  toptab <- topTable(efit, coef = contrast_name, sort.by = "P", n = Inf)
+  
+  # Store in the list with the contrast name as the key
+  top_tables_list[[contrast_name]] <- toptab
+  
+  # Print or view the top table for the current contrast
+  cat("\nTop table for contrast:", contrast_name, "\n")
+  print(head(toptab))  # Displaying the first few rows of the top table
+}
+
+
+top_tables_list <- lapply(top_tables_list, function(x) {
+  x$Gene <- rownames(x)
+  return(x)
+})
+head(top_tables_list[[1]])
+top_tables_list %>% names()
+
+# Create a new list to store the filtered data frames
+top_tables_list_filtered <- list()
+# Loop through each data frame in the top_tables_list
+for (tab_name in names(top_tables_list)) {
+  # Access the data frame by name
+  tab <- top_tables_list[[tab_name]]
+  
+  tab <- tab %>% mutate(
+  background_gene = if_else(Gene %in% background_genes, "Background", "Not Background")
+  )
+  # Apply filtering: arrange by logFC and filter based on P.Value and logFC
+  filtered_tab <- tab %>% 
+    arrange(logFC) %>% 
+    filter(P.Value <= 0.05 & abs(logFC) > 1)
+  
+  # Store the filtered data frame in the new list with the same name
+  top_tables_list_filtered[[tab_name]] <- filtered_tab
+}
+
+lapply(top_tables_list_filtered, function(x) x %>% janitor::tabyl(background_gene))
+lapply(top_tables_list_filtered, nrow)
+fin_top_tables_list <- lapply(top_tables_list_filtered, function(x) x %>% filter(background_gene != "Background"))
+
+fin_top_tables_list[[1]]  %>% filter(grepl("TYR|MAGE|MLAN", Gene)) # to check if any of the vaccine antigen peptides may be
+
+genes_change <- unique(c(fin_top_tables_list[[1]]$Gene,fin_top_tables_list[[2]]$Gene))
+intersect(fin_top_tables_list[[2]]$Gene,genes_R2_R3)
+```
+
+```{r}
+limma_toptab_R3 <- limma_toptab
+limma_toptab_R2 <- limma_toptab
+
+genes_R2_R3 <- intersect(limma_toptab_R2$Gene,limma_toptab_R3$Gene)
+genes_R2_R3 <- genes_R2_R3[!grepl("^LOC", genes_R2_R3)]
+
+genes_R2_R3 %>% saveRDS("genes_R2_R3.Rda")
+```
+
+### Figures 1 (volcano)
+- https://bioconductor.org/packages/devel/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html
+```{r}
+a <- 1
+head(fin_top_tables_list)
+# Gene expression table
+fin.volcano.tab <- data.frame(fin_top_tables_list[[a]]) %>% arrange(desc(logFC)) #%>% filter(background_gene == "Not Background")
+rownames(fin.volcano.tab) <- fin.volcano.tab$Gene
+# up in Melanoma
+top_sig_genes_up <- fin.volcano.tab %>% filter(logFC > 0 ) %>% 
+  #filter(Gene %in% genes_R2_R3) %>% 
+  filter(!grepl("LOC", Gene)) %>% 
+  arrange(P.Value) %>% 
+  head(10) %>% 
+  pull(Gene)
+# up in HD
+top_sig_genes_down <- fin.volcano.tab %>% filter(logFC < 0 ) %>% 
+  # filter(Gene %in% genes_R2_R3) %>% 
+  filter(!grepl("LOC", Gene)) %>% 
+  arrange(P.Value) %>% 
+  head(10) %>% 
+  pull(Gene)
+
+
+# Volcano Plot
+###########
+EnhancedVolcano::EnhancedVolcano(top_tables_list[[a]],
+    lab = rownames(top_tables_list[[a]]),
+    title = "Baseline comparison",
+    subtitle = NULL,
+    caption = NULL,
+    x = 'logFC', maxoverlapsConnectors = Inf,
+    y = 'P.Value',
+    selectLab = c(top_sig_genes_up,top_sig_genes_down),
+    xlab = bquote(~Log[2]~ 'fold change'),
+    ylim = c(0, 5.5),
+    pCutoff = 0.05,
+    FCcutoff = 0.5,
+    pointSize = 3.0,
+    labSize = 4.0,
+    labCol = 'black',
+    labFace = 'plain',
+    boxedLabels = TRUE,
+    parseLabels = TRUE,
+    col = c('black','grey', 'purple', 'red3'),  # Adjust colors if necessary
+    colAlpha = 4/5,
+    legendLabels = c('Not significant','LogFC > 0.5', 'p-value <= 0.05', 'p-value <= 0.05 & LogFC > 0.5'),
+    legendPosition = 'right',
+    legendLabSize = 14,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = 'black') +
+    annotate("text", x = c(-3, 3), y = 5.2, label = c("Bad Outcome","Good Outcome"), size = 6)
+```
+
+### Figures 1 (counts)
+```{r}
+R3_rpk_long_wo_HDs <- PHIPseq_list$R3_rpk_long
+R3_rpk_long_wo_HDs %<>% filter(Sample %in% c(d0_pts,d43_pts_HDs))
+R3_rpk_long_wo_HDs %<>% filter(Outcome != "HD")
+R3_rpk_long_wo_HDs$Outcome <- factor(R3_rpk_long_wo_HDs$Outcome, levels=c("Good","Bad"))
+R3_rpk_long_wo_HDs$Out_cycle <- factor(paste(R3_rpk_long_wo_HDs$Outcome,R3_rpk_long_wo_HDs$Vac_cycle,sep="_")) 
+head(R3_rpk_long_wo_HDs)
+
+top_sig_genes_up
+comparisons <- list(c("Bad_day_0", "Bad_day_43"),c("Good_day_0" ,"Good_day_43"))  
+gene_int <- c("MR1")
+R3_rpk_long_wo_HDs %>%  filter(Expression > 0) %>% 
+  #filter(Outcome =="Good") %>% 
+  #filter(grepl("pt_", Sample)) %>% 
+  dplyr::filter(Gene == gene_int) %>% 
+  ggplot(aes(x = Out_cycle, y = log2(Expression+0.01))) +
+  geom_boxplot() +
+    geom_point(aes(col = Response)) +
+        scale_color_manual(values = c(colors_LHB$Response))+
+  theme(aspect.ratio = 1) + theme_bw()+
+  ggtitle(paste0("Expression of ", gene_int, " gene")) +
+  stat_compare_means(
+      method = "wilcox.test", 
+      comparisons = comparisons,      # List of comparisons to make
+      aes(label = sprintf("p = %.2f", as.numeric(..p.format..))),  
+      label.y = max_y + 0.5,          
+      size = 4.5,                       
+      tip.length = 0.02,               
+       vjust = 0.05                    
+    ) 
+  
+PHIPseq_list$R3_rpk_long %>% 
+  filter(Outcome !="HD") %>% 
+  #filter(grepl("pt_", Sample)) %>% 
+  dplyr::filter(Gene == gene_int) %>% 
+ # left_join(df_Phip_metadata, by = c("Sample" = "strings")) %>% 
+  ggplot(aes(x = Vac_cycle, y = log(Expression))) +
+  geom_boxplot() +
+  geom_line(aes(group = Subject_ID), color = "Grey25", alpha = 0.3) +
+  geom_point(aes(col = Response)) +
+        scale_color_manual(values = c(colors_LHB$Response))+
+  theme(aspect.ratio = 1) + theme_bw()+
+  ggtitle(paste0("Expression of ", gene_int, " gene")) +
+  facet_wrap(~Outcome)
+```
+
+### Multi Box Plots (counts)
+```{r}
+library(patchwork)  # For combining plots into a grid
+jitter_box_1 <- position_jitter(width = 0.2, height = 0)
+# Define the genes of interest
+gene_int <- c(top_sig_genes_down)
+
+# Define comparisons to be made for the stat_compare_means
+comparisons <- list(c("Bad_day_0", "Bad_day_43"),c("Good_day_0" ,"Good_day_43"))  
+
+plot_list <- list()
+# Loop over each gene in the gene_int list
+for (gene in gene_int) {
+  
+  # Filter the data for the current gene
+  gene_data <- R3_rpk_long_wo_HDs %>%
+    dplyr::filter(Gene == gene)
+  gene_data$Out_cycle <- factor(gene_data$Out_cycle, levels=c("Bad_day_0", "Bad_day_43","Good_day_0" ,"Good_day_43"))
+  # Calculate the maximum y value for the current gene
+  max_y <- max(log2(gene_data$Expression+0.01), na.rm = TRUE)
+  
+  # Create the plot
+  p <- gene_data %>%
+    ggplot(aes(x = Out_cycle, y = log2(Expression+0.01))) +
+    geom_boxplot(outlier.shape = NA) +
+    #geom_point(aes(col = Response)) +
+     geom_jitter(position = jitter_box_1, aes(col = Response),
+                 size = 2, alpha = 0.5) +
+    scale_color_manual(values = c(colors_LHB$Response)) +
+    scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+    
+    theme_prism() +
+      labs(title = "Baseline PHIP-seq expression",
+           # x = "",
+           y = "PHIP-seq log(rpk)") +
+    theme(
+      aspect.ratio = 2/1.7,
+      legend.position = "none",
+      plot.title = element_text(size = 15),
+      axis.title.x = element_blank(),  # Remove x-axis label
+      axis.title.y = element_blank()   # Remove y-axis label
+    ) +
+    stat_compare_means(
+      method = "wilcox.test", 
+      comparisons = comparisons,      # List of comparisons to make
+      aes(label = sprintf("p = %.2f", as.numeric(..p.format..))),  
+      label.y = max_y + 0.5,          
+      size = 4.5,                       
+      tip.length = 0.02,               
+       vjust = 0.05                    
+    ) +
+    ggtitle(paste0(gene))
+
+  plot_list[[gene]] <- p   # Add the plot to the list
+}
+
+# Combine all plots into a grid using patchwork
+combined_plot <- wrap_plots(plot_list, ncol = 5) 
+print(combined_plot)
+# combined_plot + plot_layout(guides = "collect") 
+#   theme(legend.position = "right")# & labs(x = "Serveur", y = "Distance Parcourue")
+```
+
+### Background Expression Statistics 
+```{r}
+log2_Phip_R3_rpk <- matrix_phip
+df_test <- data.frame(Row_sums =rowSums(log2_Phip_R3_rpk))
+head(df_test)
+background_threshold <- quantile(df_test$Row_sums, 0.05)
+df_test <- df_test %>% 
+  mutate(Background = ifelse(Row_sums <= background_threshold, "Yes", "No"))
+df_test %>% janitor::tabyl(Background)
+
+background_genes <- df_test %>% filter(Background == "Yes") %>% pull(Gene)
+
+ggplot(df_test, aes(x = log2(Row_sums))) + 
+  geom_histogram(bins = 250, aes(fill = Background)) +
+   scale_fill_manual(values = c("grey40","black"))+
+    #geom_vline(xintercept = log2(background_threshold), linetype = "dashed", color = "red", size = 1) +  # Vertical line
+  theme_prism() +
+  ggtitle("Distribution of Phip-seq Expression Values") +
+    labs(title = "Distribution of PHip-seq Expression Values",  
+       x = "Log2(rpk)",                         
+       y = "count") +        
+  theme(aspect.ratio = 1/1)  +
+  theme_prism()   
+
+names(Phip_R3_rpk)
+head(df_test)
+
+df_test$Healthy <- rowSums(Phip_R3_rpk[, grep("^HD[1-9]|HC[0-9]+", colnames(Phip_R3_rpk))])
+df_test$Melanoma_Pts <- rowSums(Phip_R3_rpk[, grep("^pt_", colnames(Phip_R3_rpk))])
+df_test$Gene <- rownames(df_test)
+
+#genes_R2_R3 # genes that overlap in LImma analysis btween R2 and R3
+
+limma_toptab_genes <- limma_toptab %>%  # genes from R3 limma analysis 
+  filter(!grepl("LOC", Gene)) %>% 
+  arrange(P.Value) %>% pull(Gene)
+
+df_test %<>% mutate(
+  Significant_gene = if_else(Gene %in% limma_toptab_genes, "Significant", NA)
+)
+df_test %>% janitor::tabyl(Background,Significant_gene)
+
+df_test %<>% left_join(limma_toptab, by = "Gene")
+# Define a vector of genes you want to label
+genes_to_label <- c(df_test$Gene)  # Replace with your genes of interest
+genes_to_label
+# Plot with selected gene labe
+
+df_test %>% filter(Background == "No") %>% filter(Cancer == "Healthy") %>% filter(Significant_gene == "Significant")
+df_test %>% filter(Background == "No") %>% filter(Cancer == "Cancer") %>% filter(Significant_gene == "Significant")
+
+head(df_test)
+df_test$Cancer %>% unique()
+ggplot(df_test, aes(x = log2(Healthy), y = log2(Melanoma_Pts))) +
+   geom_point(data = df_test %>% filter(Background == "Yes") %>% filter(is.na(Cancer)),
+             color = "black", size = 0.5) +  # First set of points for Healthy
+  geom_point(data = df_test %>% filter(Background == "No") %>% filter(is.na(Cancer)), 
+             color = "Grey80", size = 0.5) +  # First set of points for Healthy
+  geom_point(data = df_test %>% filter(Background == "No") %>% filter(Cancer == "Healthy") %>% 
+               filter(Significant_gene == "Significant"),
+              color = "#88B8CA", size = 2) +  # First set of points for Healthy
+  geom_point(data = df_test %>% filter(Background == "No") %>% filter(Cancer == "Cancer") %>% 
+               filter(Significant_gene == "Significant"),
+              color = "#FFB6C1", size = 2) +  # Second set of points for Melanoma
+  # geom_text(aes(label = ifelse(Gene %in% c(top_sig_genes_up, top_sig_genes_down), Gene, NA)),  # Label significant genes
+  #           vjust = 1.5, hjust = 1, check_overlap = TRUE) +
+    #geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") +  # 45-degree line
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "black", size = 0.5) +  # Correlation line
+  #   geom_text_repel(
+  #   aes(label = ifelse(Gene %in% c(top_sig_genes_up), Gene, NA)),color = "red4",  # Label significant genes
+  #   #vjust = 1.5, hjust = -1,
+  #   box.padding = 0.25,     # Padding around labels
+  #   point.padding = 0.1,   # Padding around points
+  #   segment.color = 'black', # Color of the line segment
+  #   max.overlaps = Inf,    # Allow maximum number of overlaps before truncating
+  #   na.rm = TRUE           # Remove NA labels
+  # ) +
+  #     geom_text_repel(
+  #   aes(label = ifelse(Gene %in% c(top_sig_genes_down), Gene, NA)),color = "navy",  # Label significant genes
+  #   #vjust = 1.5, hjust = -1,
+  #   box.padding = 0.25,     # Padding around labels
+  #   point.padding = 0.1,   # Padding around points
+  #   segment.color = 'black', # Color of the line segment
+  #   max.overlaps = Inf,    # Allow maximum number of overlaps before truncating
+  #   na.rm = TRUE           # Remove NA labels
+  # ) +
+  labs(title = "Melanoma Patients vs Healthy Controls",  
+       x = "HD Log2(rpk)",                         
+       y = "Melanoma Log2(rpk)") +        
+  theme(aspect.ratio = 1/1)  +
+  theme_prism()                                        
+```
+
+```{r}
+# selecting good and bad patients at baseline
+matrix_phip <- dfa %>% select(all_of(d0_pts_HDs)) %>% 
+  select(matches("pt_")) #%>% 
+  select(matches("day_0|day_89_101")) 
+meta_phip <- PHIPseq_list$df_Phip_metadata %>% filter(strings %in% c(d0_pts_HDs)) %>% 
+    filter(grepl("pt_", strings)) #%>% 
+  filter(Vac_cycle %in% c("day_0","day_89_101"))
+####################
+matrix_phip <- dfa %>% select(all_of(d0_pts_HDs)) %>% 
+  select(matches("pt_")) %>% 
+  select(matches("day_0|day_89_101")) 
+
+meta_phip <- PHIPseq_list$df_Phip_metadata %>% filter(strings %in% c(bad_outcomw_pts)) %>% 
+    filter(grepl("pt_", strings)) %>% 
+  filter(Vac_cycle %in% c("day_0","day_89_101"))
+
+```

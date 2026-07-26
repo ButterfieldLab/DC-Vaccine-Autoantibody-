@@ -1,0 +1,331 @@
+---
+title: "Autoantidoby manuscript"
+output: html_document
+date: "2024-09-20"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Paths/libraries/source code
+```{r}
+# ---- Project setup: paths, packages, colours/themes ----------------------
+# Replaces the original machine-specific absolute paths and the two lost
+# source files (autoantibody_libraries.R, LHB_color_tools.R). setup.R defines
+# file_path, data_path, results_path and loads all packages + figure themes.
+if (file.exists("setup.R")) source("setup.R") else source(file.path("R", "setup.R"))
+```
+
+# Read tables
+```{r}
+metadata_df <- read_xlsx(paste0(data_path,"cancer vaccine Clinical Metadata.xlsx"),  sheet = 1)
+Clinical_DF <- read.csv(paste0(data_path,"/09_021_Clinl_Final.Table_06122022.csv")) %>% 
+    dplyr::mutate(Sequence_Number = as.factor(Sequence_Number))
+raw_df <- read_csv(paste0(data_path,"REAP_cancer_vaccine_butterfield.csv"))
+annotation_df <- read_csv(paste0(data_path,"library_annotation.csv"))
+
+# filter_tab <- c('text',rep('numeric', 292))
+# Phip_seq_rpk <- read_xlsx(paste0(data_path,"downloads_study310_mapped_rpk_gene.xlsx"),col_types = filter_tab)
+Phip_seq_rpk <- read_csv(paste0(data_path,"downloads_study310_mapped_rpk_gene.csv"))
+
+gene_correct_df <- read_csv("df.csv")
+gene_correct_df %<>%   separate(`SEPT1 1-Sep`, into = c("Gene_correct", "date"), sep = " ", extra = "merge", fill = "right")
+
+gene_correct_df %>% filter(Gene_correct == "POU5F1")
+
+# FIX genes that were incoretly imported as dates
+Phip_seq_rpk <- Phip_seq_rpk %>%
+  full_join(gene_correct_df, by = c("gene" = "date")) %>%  # Join to get the 'Gene' information
+  relocate(Gene_correct, .after = gene) %>% 
+  mutate(
+    gene = if_else(is.na(Gene_correct), gene, Gene_correct), # Check if 'Gene' column is present after the join
+    #gene = if_else(gene_present == "Yes", gene_corrected, Gene) # Use 'Gene' from the joined data
+  ) %>% dplyr::select(-Gene_correct)
+
+# POU5F1 seems to be duplicated due to some gene name overlaps, so here is the fix:
+Phip_seq_rpk %>% filter(gene == "POU5F1")
+Phip_seq_rpk <- Phip_seq_rpk %>% 
+  filter(rowSums(is.na(.[, -1])) != (ncol(.) - 1))
+```
+
+# 1 metadata processing
+- metadata
+```{r}
+## Cleaning metadata
+metadata_df_v2 <- metadata_df %>%
+    ### Renaming the columns and patient information to be consistent with the data
+    dplyr::rename(Subject_ID = patient_numbers) %>%
+    mutate(Subject_ID = gsub("pt_", "PT_", Subject_ID)) %>%
+    mutate(Subject_ID = gsub("PT_H", "H", Subject_ID)) %>%
+    ### Removing the HC, these are subjects that only exist in the PhiP seq data
+    filter(!grepl("^HC", Subject_ID)) %>%
+    ### Renaming cancer to HD and Melanoma
+    mutate(Cancer = ifelse(Cancer == "None", "HD", ifelse(Cancer == "Yes", "Melanoma", Cancer)))
+
+Clinical_DF %<>%  dplyr::rename("Subject_ID" = "Sequence_Number")
+Clinical_DF %<>% mutate(Subject_ID = paste0("PT_", Subject_ID))
+
+metadata <- metadata_df_v2 %>% left_join(Clinical_DF  %>% dplyr::select(-c(PF_Survival,Overal_Survival)), by = 'Subject_ID')
+
+HC_sub_df <- as.data.frame(list(Subject_ID = str_extract(names(Phip_seq_rpk %>% dplyr::select(matches("Round3Lysate"))), "^HC[0-9]+"))) %>% filter(!is.na(.))
+
+metadata %<>% full_join(HC_sub_df) %>% 
+  dplyr::mutate_at(
+    vars(c(Cancer,Disease_Site,Metastasis,Metastasis_Site, 
+           Previous_Therapy,Checkpoint, Prior_Checkpoint,Response:Outcome)), ~ if_else(is.na(.), 'HD', .))
+
+#metadata %>% write_csv(paste(data_path, "ja_metadata_1.csv"))
+```
+
+# Round 3 phip seq 1
+- workign with PHIP-seq raw data
+```{r}
+Phip_seq_rpk <- as.data.frame(Phip_seq_rpk)
+rownames(Phip_seq_rpk) <- Phip_seq_rpk$gene
+Phip_seq_rpk$gene <- NULL
+
+### They did two experiments, one with 2 rounds of amplification and one with 3 rounds of amplification
+### They did two experiments, one with 2 rounds of amplification and one with 3 rounds of amplification
+### They did two experiments, one with 2 rounds of amplification and one with 3 rounds of amplification
+
+# dplyr::select out Round 3 aplification lysate
+Phip_seq_R3_rpk <- Phip_seq_rpk %>% dplyr::select(matches("Round3Lysate"))
+dim(Phip_seq_R3_rpk)
+
+# change names of the columns
+string_names <- names(Phip_seq_R3_rpk)
+extracted_string <- sub("_Round3Lysate_S.*", "", string_names)
+names(Phip_seq_R3_rpk) <- extracted_string
+
+my_strings <- ifelse(str_detect(extracted_string, "HD"), 
+                            str_extract(extracted_string, "HD\\d+"), 
+                            extracted_string)
+names(Phip_seq_R3_rpk) <- my_strings
+
+
+# fitler out all 0 rows
+keep <- rowSums(Phip_seq_R3_rpk[1:ncol(Phip_seq_R3_rpk)]) > 0
+Phip_seq_R3_rpk <- Phip_seq_R3_rpk[keep,]
+# take last few columns with what I believe are some control enrichment samples ...
+Phip_seq_R3_rpk <- Phip_seq_R3_rpk[,1:139]
+```
+
+# Round 3 phip seq 2
+```{r}
+subj_names <- colnames(Phip_seq_R3_rpk)
+df <- data.frame(strings = subj_names, stringsAsFactors = FALSE)
+
+# Split the "strings" column into "pt" and "day" columns where applicable
+df_Phip_metadata <- df %>%
+  mutate(pt_day = ifelse(str_detect(strings, "pt_"), strings, NA)) %>%
+  separate(pt_day, into = c("Subject_ID", "Vac_cycle"), sep = "_(?=day)", extra = "merge", fill = "right") %>% 
+  mutate(Subject_ID = str_replace(Subject_ID, "pt_", "PT_")) %>% 
+  mutate(Subject_ID = if_else(is.na(Subject_ID), strings, Subject_ID)) %>% 
+  mutate(Vac_cycle = if_else(is.na(Vac_cycle), "day_0", Vac_cycle))
+
+df_Phip_metadata %<>% 
+  dplyr::mutate_at(
+    vars(c(Subject_ID:Vac_cycle)), ~ if_else(is.na(.), 'HD', .)) %>% 
+  left_join(metadata, by = "Subject_ID")
+
+all(colnames(Phip_seq_R3_rpk) == df_Phip_metadata$strings)
+
+Phip_seq_R3_rpk$Gene <- rownames(Phip_seq_R3_rpk)
+
+R3_rpk_long <- Phip_seq_R3_rpk %>% gather(key = "Sample", value = "Expression", 
+                               names(Phip_seq_R3_rpk[, !names(Phip_seq_R3_rpk) %in% "Gene"]))
+R3_rpk_long %<>% left_join(df_Phip_metadata, by = c("Sample" = "strings"))
+
+R3_rpk_long %>%  group_by(Sample) %>% 
+  summarise(sum = sum(Expression)) %>% pull(sum) %>% unique()
+
+Phip_seq_R3_rpk$Gene <- NULL
+```
+### Round 3 PHIPseq_list 
+```{r}
+PHIPseq_list <- list()
+PHIPseq_list$df_Phip_metadata <- df_Phip_metadata # contains metadata with vac_cycle information 
+PHIPseq_list$Phip_seq_R3_rpk <- Phip_seq_R3_rpk # contaised 0 count removed rpk values 
+PHIPseq_list$R3_rpk_long <- R3_rpk_long # contains long (tidied) version of the filtered_R3_rpk
+```
+
+# Round 2 phip seq 1
+- workign with PHIP-seq raw data
+```{r}
+# dplyr::select out Round 2 aplification lysate
+Phip_seq_R2_rpk <- Phip_seq_rpk %>% dplyr::select(matches("Round2Lysate"))
+# on the round lysate 2 did not have a well ballanced HC 
+Phip_seq_R2_rpk %<>%  dplyr::select(matches("HD|pt_[0-9]+")) 
+#controls
+
+# change names of the columns
+string_names <- names(Phip_seq_R2_rpk)
+extracted_string <- sub("_Round2Lysate_S.*", "", string_names)
+names(Phip_seq_R2_rpk) <- extracted_string
+
+my_strings <- ifelse(str_detect(extracted_string, "HD"), 
+                            str_extract(extracted_string, "HD\\d+"), 
+                            extracted_string)
+names(Phip_seq_R2_rpk) <- my_strings
+
+
+# fitler out all 0 rows
+keep <- rowSums(Phip_seq_R2_rpk[1:ncol(Phip_seq_R2_rpk)]) > 0
+Phip_seq_R2_rpk <- Phip_seq_R2_rpk[keep,]
+```
+
+# Round 2 phip seq 2
+```{r}
+subj_names <- colnames(Phip_seq_R2_rpk)
+df <- data.frame(strings = subj_names, stringsAsFactors = FALSE)
+
+# Split the "strings" column into "pt" and "day" columns where applicable
+df_Phip_metadata <- df %>%
+  mutate(pt_day = ifelse(str_detect(strings, "pt_"), strings, NA)) %>%
+  separate(pt_day, into = c("Subject_ID", "Vac_cycle"), sep = "_(?=day)", extra = "merge", fill = "right") %>% 
+  mutate(Subject_ID = str_replace(Subject_ID, "pt_", "PT_")) %>% 
+  mutate(Subject_ID = if_else(is.na(Subject_ID), strings, Subject_ID)) %>% 
+  mutate(Vac_cycle = if_else(is.na(Vac_cycle), "day_0", Vac_cycle))
+
+df_Phip_metadata %<>% 
+  dplyr::mutate_at(
+    vars(c(Subject_ID:Vac_cycle)), ~ if_else(is.na(.), 'HD', .)) %>% 
+  left_join(metadata, by = "Subject_ID")
+
+all(colnames(Phip_seq_R2_rpk) == df_Phip_metadata$strings)
+
+Phip_seq_R2_rpk$Gene <- rownames(Phip_seq_R2_rpk)
+
+R2_rpk_long <- Phip_seq_R2_rpk %>% gather(key = "Sample", value = "Expression", 
+                               names(Phip_seq_R2_rpk[, !names(Phip_seq_R2_rpk) %in% "Gene"]))
+R2_rpk_long %<>% left_join(df_Phip_metadata, by = c("Sample" = "strings"))
+
+R2_rpk_long %>%  group_by(Sample) %>% 
+  summarise(sum = sum(Expression)) %>% pull(sum) %>% unique()
+
+Phip_seq_R2_rpk$Gene <- NULL
+```
+### Round 2n PHIPseq_list
+```{r}
+PHIPseq_list$Phip_seq_R2_rpk <- Phip_seq_R2_rpk # contaised 0 count removed rpk values 
+PHIPseq_list$R2_rpk_long <- R2_rpk_long # contains long (tidied) version of the filtered_R3_rpk
+
+PHIPseq_list %>% saveRDS(paste0(data_path, "PHIPseq_list.Rda"))
+```
+
+# Background Gene Selection
+- previous calculation and Row_sums_rpk df creation
+```{}
+# These calculations for lowest 5% expressed genes and 
+# 0 counts present in each row were
+# done ahead and saved into "Row_sums_rpk_statistics.Rda"
+Row_sums_rpk_All <- data.frame(Row_sums =rowSums(matrix_phip))
+Row_sums_rpk_All$zero_count <- rowSums(matrix_phip == 0)
+Row_sums_rpk_All %>% arrange(desc(zero_count))
+
+Row_sums_rpk_HD <- data.frame(Row_sums =rowSums(matrix_phip))
+Row_sums_rpk_HD$zero_count <- rowSums(matrix_phip == 0)
+Row_sums_rpk_HD %>% arrange(desc(zero_count))
+
+Row_sums_rpk_pts <- data.frame(Row_sums =rowSums(matrix_phip))
+Row_sums_rpk_pts$zero_count <- rowSums(matrix_phip == 0)
+
+Row_sums_rpk <- data.frame(Gene = rownames(Row_sums_rpk_All),
+                           Row_sums_All = Row_sums_rpk_All$Row_sums, 
+                           All_0_counts = Row_sums_rpk_All$zero_count, 
+                           Row_sums_HD = Row_sums_rpk_HD$Row_sums, 
+                           HD_0_counts = Row_sums_rpk_HD$zero_count, 
+                           Row_sums_Pts = Row_sums_rpk_pts$Row_sums,
+                           Pts_0_counts = Row_sums_rpk_pts$zero_count)
+Row_sums_rpk %>% saveRDS("Row_sums_rpk_statistics.Rda")
+```
+
+
+```{r}
+Row_sums_rpk <-  readRDS(file.path(data_path, "Row_sums_rpk_statistics.Rda"))
+
+rownames(Row_sums_rpk) <- Row_sums_rpk$Gene
+background_threshold <- quantile(Row_sums_rpk$Row_sums_All, 0.05) # select bottom 5% of PHIP-seq reads
+Row_sums_rpk <- Row_sums_rpk %>% 
+  mutate(Background = ifelse(Row_sums_All <= background_threshold, "Background", "Clear"))
+Row_sums_rpk %>% janitor::tabyl(Background)
+# 997 bottom 5% genes
+# 18929 is clear
+########################################
+head(Row_sums_rpk)
+
+Row_sums_rpk %>% 
+  # mutate(Zero_counts = ifelse(HD_0_counts < 40 & Pts_0_counts < 120, "Low", "High")) %>% 
+  ggplot(aes(x = HD_0_counts , y = Pts_0_counts)) + 
+  geom_point(aes(color = Background), size = 1) +
+    geom_point(aes(color = Background), size = 0.5) +
+  scale_color_manual(values = c("red","black"))+
+  theme_prism() + theme(aspect.ratio = 1/1)
+
+Row_sums_rpk %>% 
+  # mutate(Zero_counts = ifelse(HD_0_counts < 40 & Pts_0_counts < 120, "Low", "High")) %>% 
+  ggplot(aes(x = log2(Row_sums_HD) , y = log2(Row_sums_Pts))) + 
+  geom_point(aes(color = Background), size = 0.5) +
+    theme(aspect.ratio = 1/1)  +
+  scale_color_manual(values = c("red","black"))+
+  theme_prism()  + theme(aspect.ratio = 1/1)
+
+head(Row_sums_rpk)
+# calculate 75% of samples
+(length(filtered_subjects)/100)*75
+Row_sums_rpk %>% mutate(Zero_counts = ifelse(All_0_counts < 105, "Low", "High")) %>%
+  janitor::tabyl(Zero_counts)
+# 1830 have too many counts
+
+Row_sums_rpk %>% 
+  mutate(Zero_counts = ifelse(All_0_counts < 105, "Low", "High")) %>%
+  ggplot(aes(x = log2(Row_sums_HD) , y = log2(Row_sums_Pts))) + 
+  geom_point(aes(color = All_0_counts), size = 0.5) +
+    facet_wrap(~Zero_counts ) +
+    theme_prism() + theme(aspect.ratio = 1/1)
+
+Row_sums_rpk %>% 
+   mutate(Zero_counts = ifelse(All_0_counts < 105, "Low", "High")) %>% 
+  ggplot(aes(x = log2(Row_sums_All))) + 
+  geom_histogram(bins = 250, aes(fill = Zero_counts)) +
+   scale_fill_manual(values = c("red","black"))+
+    #geom_vline(xintercept = log2(background_threshold), linetype = "dashed", color = "red", size = 1) +  # Vertical line
+  theme_prism() +
+  ggtitle("Distribution of Phip-seq Expression Values") +
+    labs(title = "Distribution of Phip-seq Expression Values",  
+       x = "Log2(rpk)",                         
+       y = "count") +        
+  theme(aspect.ratio = 1/1)  +
+  theme_prism()  + facet_wrap(~Background , scales = "free_x") 
+
+clear_0count_genes <- Row_sums_rpk %>% 
+  filter(Background == "Clear") %>% 
+  mutate(Zero_counts = ifelse(All_0_counts < 105, "Low", "High")) %>% 
+  filter(Zero_counts == "Low") %>% pull(Gene)
+```
+
+### Save new tables/vectors to PHIPseq_list
+```{r}
+PHIPseq_list$Row_sums_rpk <- Row_sums_rpk
+PHIPseq_list$clear_0count_genes <- clear_0count_genes
+PHIPseq_list %>% saveRDS(paste0(data_path, "PHIPseq_list.Rda"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1183 @@
+---
+title: "Autoantidoby manuscript (Vaccine-induced kinetic analyses)"
+output: html_document
+date: "2024-09-20"
+editor_options: 
+  chunk_output_type: console
+---
+
+- in this script I will apply limma model to determine which auto-abs are enrichned in Melanoma vs HD samples
+at baseline.
+- I will perform differential gene expression
+- visualizations: volcano plots, counts 
+
+# Paths/libraries/source code
+```{r}
+# ---- Project setup: paths, packages, colours/themes ----------------------
+# Replaces the original machine-specific absolute paths and the two lost
+# source files (autoantibody_libraries.R, LHB_color_tools.R). setup.R defines
+# file_path, data_path, results_path and loads all packages + figure themes.
+if (file.exists("setup.R")) source("setup.R") else source(file.path("R", "setup.R"))
+```
+
+# read PHIPseq_list
+```{r}
+PHIPseq_list <-  readRDS(paste0(data_path, "PHIPseq_list.Rda"))
+names(PHIPseq_list)
+```
+
+## 1. select subjects
+```{r}
+VAC_CYC = "_0|_43|_89"
+SUBJ_TYPE = c("Melanoma")
+VAR = "Outcome" 
+VAR_VAL = c("Good","Bad")
+```
+### a) define matrix_phip & meta_phip
+### b) filter background genes
+```{r}
+# Define the function with an additional variable and value for filtering
+filter_meta_subjects <- function(meta_name, vac_cycle = NULL, cancer = NULL, outcome = NULL, outcome_val = NULL) {
+  # Apply filtering based on input arguments
+  
+  filtered_df <- PHIPseq_list[[meta_name]] %>%
+    filter(
+      (is.null(vac_cycle) | grepl(vac_cycle, Vac_cycle)) &
+      (is.null(Cancer) | Cancer %in% c(cancer))
+    )
+  
+  # Apply additional filtering if specified by outcome
+  if (!is.null(outcome) & !is.null(outcome_val)) {
+    filtered_df <- filtered_df %>%
+      filter(!!sym(outcome) %in% c(outcome_val))
+  }
+  
+  # Extract and return the 'strings' column
+  return(filtered_df %>% pull(strings))
+}
+
+# SELECT subjects for analyses
+filtered_subjects <- filter_meta_subjects(meta_name = "df_Phip_metadata",
+                                           vac_cycle = c(VAC_CYC), 
+                                            cancer = c(SUBJ_TYPE), 
+                                            outcome = VAR, outcome_val = c(VAR_VAL)
+                                          )
+
+# Define a function to subset and format matrix and metadata
+prepare_phip_data <- function(data_name, phip_list, pts) {
+  # Subset the matrix based on the input dataset name and patients of interest
+  matrix_phip <- phip_list[[data_name]] %>% 
+    dplyr::select(all_of(intersect(pts, colnames(phip_list[[data_name]]))))
+  
+  # Subset the metadata to match the columns of the matrix
+  meta_phip <- phip_list$df_Phip_metadata %>% 
+    filter(strings %in% colnames(matrix_phip))
+  
+  # Set the row names of the metadata to match the column names of the matrix
+  rownames(meta_phip) <- meta_phip$strings
+  
+  # Return the matrix and metadata as a list
+  list(matrix = matrix_phip, metadata = meta_phip)
+}
+
+# use of the function and CHOOSE dtaaset
+phip_data <- prepare_phip_data("Phip_seq_R3_rpk", PHIPseq_list, filtered_subjects)
+
+# Accessing the resulting matrix and metadata
+matrix_phip <- phip_data$matrix
+matrix_phip <- matrix_phip[rownames(matrix_phip) %in% PHIPseq_list$clear_0count_genes, ] # remove background genes
+meta_phip <- phip_data$metadata
+####################
+# Check if column names of matrix_phip match row names of meta_phip, if not reorder the names in metadata
+if (all(colnames(matrix_phip) == rownames(meta_phip))) {
+  print("All matches")
+} else if (setequal(colnames(matrix_phip), rownames(meta_phip))) {
+  print("The column names are the same but in different order. Reordering meta_phip...")
+  meta_phip <- meta_phip[colnames(matrix_phip), ]
+  print("meta_phip has been reordered to match column names of matrix_phip.")
+} else {
+  print("The column names do not match the row names of meta_phip. No action taken.")
+}
+```
+
+# -----------------------------
+# limma model 
+# ------------
+### 1. Get DE Genes
+- resulting table = top_tables_list_filtered
+```{r}
+library('limma')
+####################
+meta_phip$Vac_cycle <- factor(meta_phip$Vac_cycle, levels=c("day_0","day_43","day_89_101"))
+meta_phip$Outcome <- factor(meta_phip$Outcome, levels=c("Good","Bad"))
+meta_phip$Outcome_cycle <- factor(paste(meta_phip$Outcome,meta_phip$Vac_cycle,sep="_")) 
+####################
+
+# Outcome vs vaccine cycle design  
+design <- model.matrix(~0 + Outcome_cycle, data = meta_phip)
+colnames(design) <- levels(meta_phip$Outcome_cycle)
+
+contrast_matrix <- makeContrasts(
+  Good_day_43_vs_Good_day_0 = Good_day_43 - Good_day_0,
+  Good_day_89_vs_Good_day_0 = Good_day_89_101 - Good_day_0,
+  Good_day_89_vs_Good_day_43 = Good_day_89_101 - Good_day_43,
+  
+  Bad_day_43_vs_Bad_day_0 = Bad_day_43 - Bad_day_0,
+  Bad_day_89_vs_Bad_day_0 = Bad_day_89_101 - Bad_day_0,
+  Bad_day_89_vs_Bad_day_43 = Bad_day_89_101 - Bad_day_43,
+  
+   Day_0_Good_vs_Bad = Good_day_0 - Bad_day_0,
+   Day_43_Good_vs_Bad = Good_day_43 - Bad_day_43,
+   Day_89_Good_vs_Bad = Good_day_89_101 - Bad_day_89_101,
+
+  levels = design
+)
+
+# Assuming `matrix_phip` is your data matrix with genes/proteins as rows and samples as columns
+# log transformation of the data
+log_rpk <- log2(matrix_phip + 0.01)  # Adding 0.01 to avoid log(0)
+# Fit the linear model to the log-transformed data
+vfit <- lmFit(log_rpk, design)
+# Apply the contrast matrix
+vfit <- contrasts.fit(vfit, contrast_matrix)
+# Perform empirical Bayes smoothing to the standard errors
+efit <- eBayes(vfit)
+# Extract the top table with all results
+
+top_tables_list <- list()
+
+# Loop through each contrast and extract top tables
+for (contrast_name in colnames(contrast_matrix)) {
+  # Extract top table for the current contrast
+  toptab <- topTable(efit, coef = contrast_name, sort.by = "P", n = Inf)
+  
+  # Store in the list with the contrast name as the key
+  top_tables_list[[contrast_name]] <- toptab
+  
+  # Print or view the top table for the current contrast
+  cat("\nTop table for contrast:", contrast_name, "\n")
+  print(head(toptab))  # Displaying the first few rows of the top table
+}
+
+# add Gene as a column
+top_tables_list <- lapply(top_tables_list, function(x) {
+  x$Gene <- rownames(x)
+  return(x)
+})
+
+# Create a new list to store the filtered data frames
+top_tables_list_filtered <- list()
+# Loop through each data frame in the top_tables_list
+for (tab_name in names(top_tables_list)) {
+  # Access the data frame by name
+  tab <- top_tables_list[[tab_name]]
+  
+  # Apply filtering: arrange by logFC and filter based on P.Value and logFC
+  filtered_tab <- tab %>% 
+    arrange(logFC) %>% 
+    filter(P.Value <= 0.05 & abs(logFC) > 0.5)
+  
+  filtered_tab <- filtered_tab %>% mutate(Direction = if_else(logFC > 0, "Up", "Down")) 
+  # Store the filtered data frame in the new list with the same name
+  top_tables_list_filtered[[tab_name]] <- filtered_tab
+}
+
+lapply(top_tables_list_filtered, function(x) x %>% janitor::tabyl(Direction))
+```
+# -----------------------------
+
+### Figures 1 (volcano)
+- https://bioconductor.org/packages/devel/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html
+```{r}
+# Use gsub to replace underscores and remove everything after '_vs_'
+# gsub("_", " ", sub("_vs_.*", "", names(top_tables_list_filtered[1])))
+# gsub("_", " ", sub(".*_vs_", "", names(top_tables_list_filtered[1])))
+
+names(top_tables_list_filtered)
+
+# Function to extract part of the string before or after _vs_:
+# BEST works with 1:6 - the names later are shorter and do not fit the naming formula (will fix later)
+extract_part <- function(input_string, choice = "1st") {
+  if (choice == "1st") {
+    # Extract the part 1st '_vs_'
+    result <- gsub("_", " ", sub("_vs_.*", "", input_string))
+  } else if (choice == "2nd") {
+    # Extract the part 2nd '_vs_'
+    result <- gsub("_", " ", sub(".*_vs_", "", input_string))
+  } else {
+    stop("Invalid choice. Please use '1st' or '2nd'.")
+  }
+  
+  return(result)
+}
+
+names(top_tables_list_filtered[1])
+data_set = 1
+# Gene expression table
+fin.volcano.tab <- data.frame(top_tables_list_filtered[[data_set]]) %>% arrange(desc(logFC))
+rownames(fin.volcano.tab) <- fin.volcano.tab$Gene
+# up in Melanoma
+top_sig_genes_up <- fin.volcano.tab %>% filter(logFC > 0 ) %>% 
+  #filter(Gene %in% genes_R2_R3) %>% 
+  filter(!grepl("LOC", Gene)) %>% 
+  arrange(P.Value) %>% 
+  head(10) %>% 
+  pull(Gene)
+# up in HD
+top_sig_genes_down <- fin.volcano.tab %>% filter(logFC < 0 ) %>% 
+  # filter(Gene %in% genes_R2_R3) %>% 
+  filter(!grepl("LOC", Gene)) %>% 
+  arrange(P.Value) %>% 
+  head(10) %>% 
+  pull(Gene)
+
+# Volcano Plot
+###########
+
+#FIX the labels 
+EnhancedVolcano::EnhancedVolcano(top_tables_list[[data_set]],
+    lab = rownames(top_tables_list[[data_set]]),
+    title = "Baseline comparison",
+    subtitle = NULL,
+    caption = NULL,
+    x = 'logFC', maxoverlapsConnectors = Inf,
+    y = 'P.Value',
+    selectLab = c(top_sig_genes_up,top_sig_genes_down),
+    xlab = bquote(~Log[2]~ 'fold change'),
+    ylim = c(0, 8),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 3.0,
+    labSize = 4.0,
+    labCol = 'black',
+    labFace = 'plain',
+    boxedLabels = TRUE,
+    parseLabels = TRUE,
+    col = c('black','grey', 'purple', 'red3'),  # Adjust colors if necessary
+    colAlpha = 4/5,
+    legendLabels = c('Not significant','LogFC > 0.5', 'p-value <= 0.05', 'p-value <= 0.05 & LogFC > 0.5'),
+    legendPosition = 'right',
+    legendLabSize = 14,
+    legendIconSize = 4.0,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = 'black') +
+    annotate("text", x = c(-3.5, 4.3), y = 8, label = c(extract_part(names(top_tables_list_filtered[data_set]), "1st"),
+                                                        extract_part(names(top_tables_list_filtered[data_set]), "2nd")), size = 8)
+```
+
+### Figures 1 (counts)
+```{r}
+gene_int <- c("TDP2", "PSMA5")
+  
+PHIPseq_list$R3_rpk_long %>% 
+  filter(Outcome !="HD") %>% 
+  #filter(grepl("pt_", Sample)) %>% 
+  dplyr::filter(Gene %in% c(gene_int)) %>% 
+ # left_join(df_Phip_metadata, by = c("Sample" = "strings")) %>% 
+  ggplot(aes(x = Vac_cycle, y = log(Expression))) +
+  geom_boxplot() +
+  geom_line(aes(group = Subject_ID), color = "Grey25", alpha = 0.3) +
+  geom_point(aes(col = Response)) +
+        scale_color_manual(values = c(colors_LHB$Response))+
+  theme(aspect.ratio = 1) + theme_bw()+
+  ggtitle(paste0("Expression of ", gene_int, " gene")) +
+  facet_wrap(~Outcome+Gene)
+```
+### Multi Box Plots (counts)
+```{r}
+library(patchwork)  # For combining plots into a grid
+jitter_box_1 <- position_jitter(width = 0.2, height = 0)
+# Define the genes of interest
+gene_int <- c(top_sig_genes_up)
+
+# Define comparisons to be made for the stat_compare_means
+comparisons <- list(c("Healthy", "Cancer"))  # Replace with actual group names
+
+plot_list <- list()
+# Loop over each gene in the gene_int list
+for (gene in gene_int) {
+  
+  # Filter the data for the current gene
+  gene_data <- PHIPseq_list$R3_rpk_long %>%
+    mutate(Cancer = recode(Cancer,
+                           "HD" = "Healthy",
+                           "Melanoma" = "Cancer")) %>% 
+    filter(Vac_cycle == "day_0") %>%
+    dplyr::filter(Gene == gene)
+  gene_data$Cancer <- factor(gene_data$Cancer, levels=c("Healthy","Cancer"))
+  # Calculate the maximum y value for the current gene
+  max_y <- max(log2(gene_data$Expression+0.01), na.rm = TRUE)
+  
+  # Create the plot
+  p <- gene_data %>%
+    ggplot(aes(x = Cancer, y = log2(Expression+0.01))) +
+    geom_boxplot(outlier.shape = NA) +
+    #geom_point(aes(col = Response)) +
+     geom_jitter(position = jitter_box_1, aes(col = Response),
+                 size = 2, alpha = 0.5) +
+    scale_color_manual(values = c(colors_LHB$Response)) +
+    scale_y_continuous(expand = expansion(mult = c(0.1, 0.1))) +
+    
+    theme_prism() +
+      labs(title = "Baseline PHIP-seq expression",
+           # x = "",
+           y = "PHIP-seq log(rpk)") +
+    theme(
+      aspect.ratio = 2/1.7,
+      legend.position = "none",
+      plot.title = element_text(size = 15),
+      axis.title.x = element_blank(),  # Remove x-axis label
+      axis.title.y = element_blank()   # Remove y-axis label
+    ) +
+    stat_compare_means(
+      method = "wilcox.test", 
+      comparisons = comparisons,      # List of comparisons to make
+      aes(label = sprintf("p = %.2f", as.numeric(..p.format..))),  
+      label.y = max_y + 0.5,          
+      size = 4.5,                       
+      tip.length = 0.02,               
+       vjust = 0.05                    
+    ) +
+    ggtitle(paste0(gene))
+
+  plot_list[[gene]] <- p   # Add the plot to the list
+}
+
+# Combine all plots into a grid using patchwork
+combined_plot <- wrap_plots(plot_list, ncol = 5) 
+print(combined_plot)
+# combined_plot + plot_layout(guides = "collect") 
+#   theme(legend.position = "right")# & labs(x = "Serveur", y = "Distance Parcourue")
+```
+
+# -----------------------------
+# 1. degPatterns analysis
+## a) subset patent groups of interest
+```{r}
+sub_top_list_filt <- top_tables_list_filtered[
+  grepl("Good|Bad", names(top_tables_list_filtered))]
+names(sub_top_list_filt)
+lapply(sub_top_list_filt, head)
+```
+
+## b) subset signif DE genes
+```{r}
+all_DE_genes <- c()
+# Iterate over each element in the top_tables_list_filtered
+for (i in seq_along(sub_top_list_filt)) {
+  # Extract the 'Gene' column from the i-th element of the list and add to the all_genes vector
+  all_DE_genes <- c(all_DE_genes, sub_top_list_filt[[i]] %>% pull(Gene))
+  all_DE_genes <- unique(all_DE_genes)
+}
+length(all_DE_genes)
+```
+
+## c) run DEGreport
+ - clusters_vacc.cycle_outcome was previoulsy run and saved into PHIPseq_list
+ - we can recall it (no need to run this algorythm)
+```{}
+library('DEGreport')
+# selected matrices from above code lines:
+#matrix_phip
+#meta_phip
+
+if(exists("matrix_phip") & exists("meta_phip")){
+  print("Both tables are present")
+}
+colnames(matrix_phip)  == rownames(meta_phip)
+
+sel_matrix_phip <- matrix_phip[rownames(matrix_phip) %in% all_DE_genes, ]
+colnames(sel_matrix_phip)
+
+# matrix has to be log transformed
+res_10 <- degPatterns(log2(sel_matrix_phip+0.01), meta_phip, time="Vac_cycle", col = "Outcome", 
+                   reduce = TRUE,
+                   minc = 25,
+                   nClusters = 12)
+res_10
+res_10$df %>% group_by(cluster) %>% count() %>% arrange(desc(n)) %>% filter(n > 100)
+
+clust.tab <- res_10[["normalized"]]
+clust.tab %<>% dplyr::select(genes:value, -merge, Vac_cycle,Outcome,Outcome_cycle,cluster)
+# clust.tab %>% 
+#   mutate(cluster = if_else(cluster %in% c("8","10"), "8",cluster ))
+```
+
+### - save to PHIPseq_list
+```{r}
+#PHIPseq_list$clusters_vacc.cycle_outcome <- clust.tab
+#PHIPseq_list %>% saveRDS(paste0(data_path, "PHIPseq_list.Rda"))
+
+clust.tab <- PHIPseq_list$clusters_vacc.cycle_outcome
+clust.tab$cluster <- as.factor(clust.tab$cluster) 
+clust.tab %<>% mutate(Vac_cycle = gsub("day_","",Vac_cycle),
+                      Vac_cycle = gsub("89_","",Vac_cycle))
+clust.tab$Vac_cycle <- factor(clust.tab$Vac_cycle, levels=c("0","43","101"))
+```
+## d) plot Deg Patterns
+```{r}
+cluster_labels <- setNames(paste("Cluster", unique(clust.tab$cluster)), unique(clust.tab$cluster))
+
+ggplot(clust.tab, aes(Vac_cycle, value, color = Outcome)) +
+  geom_line(data = clust.tab %>% filter(Outcome == "Good"),
+            aes(group = genes),
+            color = "red", size = 0.1, alpha = 0.5) +  
+  geom_line(data = clust.tab %>% filter(Outcome == "Bad"), 
+            aes(group = genes),
+            color = "grey45", size = 0.1, alpha = 0.5) +  
+  scale_color_manual(values = c(colors_LHB$Outcome)) +
+  theme_prism() +
+  # geom_smooth(aes(group = Outcome), method = "auto") + 
+   scale_color_manual(values = c(colors_LHB$Out_median_lines)) +
+  theme_prism() +
+  geom_smooth(aes(group = Outcome), method = "loess") + 
+  labs(title = "Auto-antibody Expression Profiles",
+              #subtitle = "adj.p < 0.05",
+              x = "Vaccine cycle",                         
+       y = "Scaled(rpk)")  +
+    theme(
+    #plot.margin = margin(0.5, 0.5, 0.5, 0.5, unit = "cm"),
+    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 14,angle = 0, face = "bold"),
+    strip.background =element_rect(fill="white", color = NA),
+    strip.placement = "outside",
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    #axis.text = element_text(size = 14),
+    legend.position = "right",
+    panel.grid.major.y = element_blank()) +
+  facet_wrap(~cluster, labeller = labeller(cluster = cluster_labels)) 
+```
+
+```{r}
+cluster_df <- clust.tab %>% 
+  dplyr::select(-Outcome_cycle,-Outcome, -value,- Vac_cycle) %>% distinct() %>% 
+  arrange(cluster) %>% 
+  mutate(ENTREZID = mapIds(org.Hs.eg.db, keys = genes, keytype="SYMBOL", column = "ENTREZID")) 
+
+cluster_df %>% group_by(cluster) %>% count() 
+cluster_list <- cluster_df %>%          
+  group_by(cluster) %>%                 
+  group_split(.keep = TRUE)             
+
+names(cluster_list) <- unique(cluster_df$cluster)
+```
+
+# PATHWAY ENRICHMENT
+### - libraries
+```{r}
+library(clusterProfiler)
+library(GSEABase)
+library(msigdbr)
+library(fgsea)
+library(enrichplot)
+library(org.Hs.eg.db)
+```
+
+## 1. ReactomePA
+```{}
+library('ReactomePA')
+
+geneUniverse <- mapIds(org.Hs.eg.db, keys = rownames(matrix_phip), keytype="SYMBOL", column = "ENTREZID")
+geneUniverse <- geneUniverse[!is.na(geneUniverse)]
+
+
+# Reactome pathway over-representation analysis
+perform_enrichment <- function(cluster_data) {
+  #set.seed(1234)
+  # Extract gene list from the cluster data (assuming 'ENTREZID' is the gene column)
+  gene_list <- unname(cluster_data$ENTREZID)
+  enrich_result <- enrichPathway(gene = gene_list, 
+                                 pvalueCutoff = 0.05, 
+                                 pAdjustMethod = "BH", 
+                                 qvalueCutoff = 0.5,
+                                 minGSSize = 10, 
+                                 maxGSSize = 5000,
+                                 readable = TRUE)
+  return(enrich_result@result)
+}
+
+# Apply the function to each cluster in the list
+enrichPathway_results <- lapply(cluster_list, perform_enrichment)
+
+lapply(enrichPathway_results, function(x) x %>% filter(pvalue <= 0.05) %>% nrow())
+```
+
+## 2. enrichGO
+```{}
+perform_enrichGO <- function(cluster_data) {
+  # Extract gene list from the cluster data (assuming 'ENTREZID' is the gene column)
+  gene_list <- unname(cluster_data$ENTREZID)
+  
+  # Perform enrichment analysis using enrichPathway
+  enrich_result <- enrichGO(gene = gene_list,
+                OrgDb         = org.Hs.eg.db,
+                keyType       = 'ENTREZID',
+                ont           = "MF", #“BP”, “MF”, “CC”, “ALL”
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.05,
+                qvalueCutoff  = 0.05)
+  
+  return(enrich_result@result)
+}
+
+# Apply the function to each cluster in the list
+enrichGO_results <- lapply(cluster_list, perform_enrichGO)
+
+enrichGO_results[[1]] %>% names()
+lapply(enrichGO_results, function(x) x %>% filter(pvalue <= 0.05) %>% nrow())
+lapply(enrichGO_results, function(x) x %>% filter(qvalue <= 0.05) %>% nrow())
+
+enrichGO_results[[1]] %>%
+   arrange(desc(Count)) %>% filter(pvalue <= 0.05) %>% 
+  filter(Count >= 3) %>% 
+  # head(25) %>%
+  ggplot(aes(x = -log2(pvalue), y =  fct_reorder(Description, -log2(pvalue)))) + #geom_col(aes(fill = DF_label)) + 
+  #geom_segment(aes(yend=Description), xend=0, colour="grey50", linewidth=1, ) +
+  geom_point(aes(size = Count, color = as.factor(Count))) +
+    theme_bw() +
+  labs(title = "Pathway Enrichment",
+              #subtitle = "adj.p < 0.05",
+              x = "-log2(pvalue)",                         
+       y = "Pathway")  +
+   scale_size_continuous(range = c(0, 9)) +
+  theme(strip.text.y = element_blank()) +
+    facet_grid(rows = vars(Count), scales = "free_y", #switch = "y", 
+             space = "free_y") 
+```
+
+## 3. enrichWP
+```{r}
+perform_enrichWP <- function(cluster_data) {
+  # Extract gene list from the cluster data (assuming 'ENTREZID' is the gene column)
+  gene_list <- unname(cluster_data$ENTREZID)
+  
+  # Perform enrichment analysis using enrichPathway
+  enrich_result <- enrichWP(gene = gene_list,
+                            organism = "Homo sapiens")
+  
+  return(enrich_result@result)
+}
+
+# Apply the function to each cluster in the list
+enrichWP_results <- lapply(cluster_list, perform_enrichWP)
+
+enrichWP_results[[1]] %>% names()
+lapply(enrichWP_results, function(x) x %>% filter(pvalue <= 0.05) %>% nrow())
+
+enrichWP_results[[1]] %>%
+   arrange(desc(Count)) %>% filter(pvalue <= 0.05) %>% 
+  filter(Count >= 3) %>% 
+  # head(25) %>%
+  ggplot(aes(x = -log2(pvalue), y =  fct_reorder(Description, -log2(pvalue)))) + #geom_col(aes(fill = DF_label)) + 
+  #geom_segment(aes(yend=Description), xend=0, colour="grey50", linewidth=1, ) +
+  geom_point(aes(size = Count, color = as.factor(Count))) +
+    theme_bw() +
+  labs(title = "Pathway Enrichment",
+              #subtitle = "adj.p < 0.05",
+              x = "-log2(pvalue)",                         
+       y = "Pathway")  +
+   scale_size_continuous(range = c(0, 9)) +
+  theme(strip.text.y = element_blank()) +
+    facet_grid(rows = vars(Count), scales = "free_y", #switch = "y", 
+             space = "free_y")
+```
+
+# ============
+# $ save/read Pathway_res_list
+```{r}
+Pathway_res_list <- list()
+Pathway_res_list$enrichPathway_res <- enrichPathway_results
+Pathway_res_list$enrichGO_res <- enrichGO_results
+Pathway_res_list$enrichWP_res <- enrichWP_results
+
+#Pathway_res_list %>%  saveRDS("Pathway_results_list.Rda")
+Pathway_res_list <-  readRDS(file.path(data_path, "Pathway_results_list.Rda"))
+names(Pathway_res_list)
+
+# Combine the data frames and add an ID column based on the element index
+combined_df <- do.call(rbind, lapply(1:12, function(i) {
+  df <- Pathway_res_list[[1]][[i]]
+  df$Cluster <- paste0(i)  # Add a column indicating the data frame's index
+  #df$Count <- as.factor(df$Count)  # Add a column indicating the data frame's index
+  return(df)
+}))
+
+glimpse(combined_df)
+
+combined_df %<>% mutate(geneID_split = gsub("/", " ", geneID))
+```
+### $ selecet a cluster
+```{r}
+result_list <- lapply(Pathway_res_list[1:3], function(x) x[[6]])
+result_list[[3]] %>% names()
+# Bind the extracted data frames into a single data frame
+combined_df <- do.call(rbind, result_list)
+```
+### $ functions
+```{r}
+# Function to add a newline after every 10th gene
+add_newline_after_10 <- function(gene_string) {
+  genes <- unlist(strsplit(gene_string, " "))  # Split by space
+  if (length(genes) > 10) {
+    # Insert newline after every 10th gene
+    paste(sapply(seq(1, length(genes), by = 10), function(i) {
+      paste(genes[i:min(i+9, length(genes))], collapse = " ")
+    }), collapse = "\n")
+  } else {
+    gene_string  # If <= 10, return the original string
+  }
+}
+
+add_newline_after_5 <- function(gene_string) {
+  genes <- unlist(strsplit(gene_string, " "))  # Split by space
+  if (length(genes) > 3) {
+    # Insert newline after every 10th gene
+    paste(sapply(seq(1, length(genes), by = 3), function(i) {
+      paste(genes[i:min(i+9, length(genes))], collapse = " ")
+    }), collapse = "\n")
+  } else {
+    gene_string  # If <= 10, return the original string
+  }
+}
+```
+### $ CLUST gene selections
+```{r}
+Gene_count <- 2
+######### CLUST_6 #########
+CLUST_6_filters <- c("Signaling by EGFR in Cancer",
+                            "Interleukin-3, Interleukin-5 and GM-CSF signaling",
+                            "Signaling by EGFR in Cancer",
+                            "Integrin signaling",
+                            "Initial triggering of complement",
+                            "Response of Mtb to phagocytosis",
+                            "Transcriptional regulation of brown and beige adipocyte differentiation",
+                            "DAP12 signaling",
+                            "TP53 Regulates Transcription of Cell Cycle Genes",
+                            "Signaling by ALK in cancer",
+                            "Sialic acid metabolism",
+                            "Costimulation by the CD28 family",
+                            "Disease",
+                            "Hemostasis",
+                            "Ion channel transport",
+                            "Vesicle-mediated transport",
+                            "Platelet activation, signaling and aggregation",
+                            "Signaling by CSF1 (M-CSF) in myeloid cells")
+
+######### CLUST_2 #########
+CLUST_2_filters <- c("Glycogen synthesis|storage diseases|glycogenolysis|trafficking and regulation|L1|Processing of Intronless Pre-mRNAs|Intronless Pre-mRNA|RNA Polymerase II")
+
+CLUST_2_filters <- combined_df %>%
+  filter(Cluster == 6) %>% 
+  filter(pvalue <= 0.05) %>% 
+  filter(Count >= Gene_count) %>%
+  filter(!grepl(CLUST_2_filters,Description)) %>% pull(Description)
+
+######### CLUST_9 #########
+CLUST_9_filters <- c("RAF-independent MAPK1/3|Xenobiotics|Gastrulation|Synthesis of bile acids and bile salts|mutants|Paradoxical|Synaptic adhesion-like|neural plate|Negative regulation of MAPK|Fatty acids|Ras activation upon Ca2+|RAF/MAP kinase cascade|fusions|RHOBTB2|RHOBTB1|GABA synthesis|MAPK1/MAPK3 signaling|CYP2E1 reactions|Dopamine Neurotransmitter|MAPK3|Serotonin Neurotransmitter|IL-6-type cytokine receptor|KIT in disease|Norepinephrine|Glycosphingolipid|Signalling to ERKs|RHOBTB")
+
+CLUST_9_filters <- combined_df %>%
+  filter(Cluster == 9) %>% 
+  filter(pvalue <= 0.05) %>% 
+  filter(Count >= Gene_count) %>%
+  filter(!grepl(CLUST_9_filters,Description)) %>% pull(Description)
+
+######### CLUST_10 #########
+
+CLUST_10_filters <- c("UCH proteinases",
+                     "Metabolism of lipids",
+                     "Neddylation",
+                     "Class I MHC mediated antigen processing & presentation",
+                     "activated TAK1 mediates p38 MAPK activation",
+                     "p38MAPK events",
+                     #"Olfactory Signaling Pathway",
+                     "Innate Immune System",
+                     "Neutrophil degranulation",
+                     "Signaling by Hedgehog",
+                     "APC/C-mediated degradation of cell cycle proteins",
+                     "TCR signaling",
+                     "C-type lectin receptors (CLRs)",
+                     "Beta-catenin independent WNT signaling",
+                     "Cross-presentation of soluble exogenous antigens (endosomes)",
+                     "Interleukin-1 family signaling",
+                     "Disorders of transmembrane transporters",
+                     "SLC transporter disorders",
+                     "Retrograde transport at the Trans-Golgi-Network")
+######### CLUST_8 #########
+CLUST_8_filters <- c("Neutrophil degranulation",
+                      "Cytoprotection by HMOX1",
+                      "Cellular response to chemical stress",
+                      "RHOBTB2 GTPase cycle",
+                      "Formation of tubulin folding intermediates by CCT/TriC")
+######### CLUST_5 #########
+CLUST_5_filters <- c("Mitochondrial Fatty Acid Beta-Oxidation",
+                      "Downregulation of TGF-beta receptor signaling",
+                     "TP53 Regulates Transcription of Genes Involved in Cytochrome C Release",
+                     "Cytokine Signaling in Immune system",
+                     "Citric acid cycle (TCA cycle)",
+                     "Interleukin-12 signaling",
+                     "Metabolism of RNA",
+                     "Metabolism of amino acids and derivatives"
+                     )
+######### CLUST_11 #########
+CLUST_11_filters <- c("Biological oxidations",
+                     "MITF-M-regulated melanocyte development",
+                     "MAPK6/MAPK4 signaling",
+                     "PTEN Regulation",
+                     "Immune System",
+                     "Innate Immune System",
+                     "Regulation of actin dynamics for phagocytic cup formation",
+                     "Metabolism",
+                     "Fcgamma receptor (FCGR) dependent phagocytosis",
+                     "Pyroptosis",
+                     "Programmed Cell Death",
+                     "Neutrophil degranulation",
+                     "Hemostasis",
+                     "Cytokine Signaling in Immune system",
+                     "Signaling by VEGF",
+                     "DDX58/IFIH1-mediated induction of interferon-alpha/beta",
+                     "Chaperone Mediated Autophagy"
+                     )
+######### CLUST_7 #########
+CLUST_7_filters <- c(
+  "Metabolism of lipids",
+  "Signal Transduction",
+  "Complement cascade",
+  "MITF-M-regulated melanocyte development",
+  "Regulation of MITF-M-dependent genes involved in pigmentation",
+  "Activation of Matrix Metalloproteinases",
+  "Cytosolic sensors of pathogen-associated DNA",
+  "Oncogenic MAPK signaling"
+)
+######### CLUST_3 ######### 
+CLUST_3_filters <- c(
+  "Oncogenic MAPK signaling",
+  "ABC transporters in lipid homeostasis",
+  "PPARA activates gene expression",
+  "Adipogenesis",
+  "ADORA2B mediated anti-inflammatory cytokines production",
+  "NOTCH1 Intracellular Domain Regulates Transcription",
+  "Parasitic Infection Pathways",
+  "Signaling by Nuclear Receptors",
+  "Gene expression (Transcription)",
+  "mRNA Splicing",
+  "Processing of Capped Intron-Containing Pre-mRNA"
+)
+#########
+
+
+```
+## 3. Dot Plot Cluster Pathways
+```{r}
+CLUST <- 3
+Gene_count <- 2
+filter_pathwas <- CLUST_3_filters
+# Create the plot
+head(combined_df)
+combined_df %>%
+  filter(Cluster == CLUST) %>% 
+  filter(pvalue <= 0.05) %>% 
+  filter(Count >= Gene_count) %>%
+ filter(Description %in% c(filter_pathwas)) %>%
+  ggplot(aes(x = -log2(pvalue), y = fct_reorder(Description, -log2(pvalue)))) +
+  geom_point(aes(size = Count), color = "navy", alpha = 0.8) +  # Keep size aesthetic here
+  labs(title = paste0("Pathway Enrichment\nCluster: ", CLUST),
+       x = "-log2(pvalue)",
+       y = "Pathway",
+       size = "Gene Count") +  # Correct the label for 'size'
+  scale_size_continuous(range = c(0, 9)) +
+  theme_classic() + 
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    strip.text = element_text(size = 14, angle = 0, face = "bold"),
+    strip.background = element_rect(fill = "white", color = NA),
+    strip.placement = "outside",
+    axis.line = element_line(size = 1),
+    axis.title.x = element_text(size = 16, face = "bold"),
+    axis.title.y = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14, face = "bold"),
+    legend.position = "right",
+    panel.grid.major.y = element_blank()
+  ) + 
+  theme(
+     legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 14, face = "bold"), 
+    legend.key.size = unit(1, "cm"), 
+    legend.key.height = unit(0.5, "cm")
+  )
+####################################################################################
+```
+
+## 4. Table Genes in Pathways
+```{r}
+head(combined_df)
+df <- combined_df %>%
+  filter(Cluster == CLUST) %>%
+    filter(pvalue <= 0.05) %>% 
+  filter(Count >= Gene_count) %>%
+  arrange(pvalue) %>%
+  filter(Description %in% c(filter_pathwas)) %>%
+  dplyr::select(Pathway = Description, `gene ID` = geneID_split) %>%
+  mutate(`gene ID` = sapply(`gene ID`, add_newline_after_10))
+
+library('flextable')
+ft <- flextable(df)
+ft <- width(ft, width = 5)
+ft <- bold(ft, j = 1, bold = TRUE)
+ft <- italic(ft, j = 2, italic = TRUE)
+ft <- bold(ft, part = "header", bold = TRUE) # Make the first row bold
+ft <- fontsize(ft,part = "header",  size = 13) 
+
+ft <- bg(ft, part = "header", bg = "grey") # Set the background color of the header row to grey
+ft <- fontsize(ft, j = 1, size = 14) # Change the font size of the first column to 10
+ft <- fontsize(ft, j = 2, size = 10)
+ft
+save_as_image(ft, path = file.path(fig_path, "flextable.png"
+                                #,res = 200 # to adjust resolution if needed
+                                ))
+```
+
+## 5. Selected Pathway Highlights
+```{r}
+# Apply the transformation to the `gene ID` column for the specific pathway
+path_genes <- df %>%
+  filter(grepl("Disease", Pathway)) %>%
+  pull(`gene ID`) %>%
+  as.character() %>%
+  strsplit(" ") %>%    # Split by space
+  unlist()
+
+plot.tab <- clust.tab %>% filter(cluster == CLUST)
+
+ggplot(plot.tab, aes(Vac_cycle, value, color = Outcome)) +
+  geom_line(data = plot.tab %>% filter(Outcome == "Good"),
+            aes(group = genes),
+            color = "red", size = 0.1, alpha = 0.5) +  
+  geom_line(data = plot.tab %>% filter(Outcome == "Bad"), 
+            aes(group = genes),
+            color = "grey45", size = 0.1, alpha = 0.5) +  
+  # geom_line(data = clust.tab %>% filter(cluster == CLUST) %>% filter(Outcome == "Good") %>%
+  #             filter(genes %in% c(path_genes)),
+  #           aes(group = genes),
+  #           color = "magenta", size = 0.5, alpha = 0.5) +
+  scale_color_manual(values = c(colors_LHB$Out_median_lines)) +
+  theme_prism() +
+  geom_smooth(aes(group = Outcome), method = "loess") + 
+  labs(title = paste0("Cluster ", CLUST ," Expression Profile"),
+              x = "Vaccine cycle",                         
+       y = "Scaled(rpk)")  +
+    theme(
+    #plot.margin = margin(0.5, 0.5, 0.5, 0.5, unit = "cm"),
+    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 14,angle = 0, face = "bold"),
+    strip.background =element_rect(fill="white", color = NA),
+    strip.placement = "outside",
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    #axis.text = element_text(size = 14),
+    legend.position = "right",
+    panel.grid.major.y = element_blank())
+```
+
+
+
+
+
+
+# =====
+### sorted vector GSEA
+## 4. KEGG
+```{r}
+mkk2 <- gseMKEGG(geneList = cluster_list[[9]]$ENTREZID, # needs to be a sorted vector
+                 organism = 'hsa',
+                 pvalueCutoff = 1)
+head(mkk2)
+```
+
+## 5. enrichGO 
+```{r}
+ja_vec <- top_tables_list_filtered$Day_89_Good_vs_Bad %>%  
+  dplyr::select(Gene,logFC) %>% 
+  arrange(desc(logFC)) %>% 
+  mutate(ENTREZID = mapIds(org.Hs.eg.db, keys = Gene, keytype="SYMBOL", column = "ENTREZID")) %>% 
+  pull(ENTREZID,logFC)
+ja_vec <- ja_vec[!is.na(ja_vec)]
+
+
+geneUniverse <- mapIds(org.Hs.eg.db, keys = rownames(matrix_phip), keytype="SYMBOL", column = "ENTREZID")
+geneUniverse <- geneUniverse[!is.na(geneUniverse)]
+
+# Run GO enrichment analysis
+ego <- enrichGO(
+    gene = ja_vec,
+    OrgDb = "org.Hs.eg.db",
+    keyType = "ENTREZID",
+    ont = "BP",
+    universe = geneUniverse,
+    pvalueCutoff=0.05,
+    pAdjustMethod="BH", 
+    qvalueCutoff=0.05,
+    #readable = TRUE
+)
+ego_summary <- slot(ego, "result") %>%
+    as_tibble() 
+head(ego_summary)
+ego_summary %>% arrange(Count) %>% filter(pvalue <= 0.05)
+hist(ego_summary$FoldEnrichment)
+ego_summary %>% 
+  filter(Count >= 10) %>% 
+   arrange(p.adjust) %>% filter(pvalue <= 0.05) %>% arrange(FoldEnrichment) %>% 
+ # head(35) %>%
+  #filter(grepl("TNF|NECROSIS|NFK|KAPP|MEK",ID)) %>% 
+  #group_by(DF_label) %>% slice(1:35) %>% 
+  ggplot(aes(x = FoldEnrichment, y =  fct_reorder(Description, FoldEnrichment))) + #geom_col(aes(fill = DF_label)) + 
+  geom_segment(aes(yend=Description,), xend=0, colour="grey50", linewidth=1, ) +
+  geom_point(aes(size = Count, fill = pvalue)) +
+  scale_color_brewer(palette = "Dark2") 
+  facet_grid(rows = vars(DF_label), scales = "free_y", #switch = "y", 
+             space = "free_y") +
+    theme_bw() +
+   labs(title = "Top TNF-TNFR/NFkB Pathways at 4hr",
+              subtitle = "adj.p < 0.05")  + xlab("NES")+ ylab("GSEA PAthways") 
+```
+
+## 6. a) msigdbr GSEA 
+```{r}
+# load in gene sets
+all_gene_sets = msigdbr(species = "Homo sapiens")
+all_gene_sets %<>% filter(gs_subcat %in% 
+                            c("CP:BIOCARTA","GO:BP","GO:CC","GO:MF",
+                              "CP:KEGG","CP:PID", "CP:REACTOME","CP:WIKIPATHWAYS",
+                              "HPO","CP")) # filter out MIRNA gene sets
+
+all_gene_sets$gs_subcat %>% unique()
+#all_gene_sets %>% filter(gs_subcat == "TFT:GTRD") %>% pull(gs_name) %>% unique()
+
+# we can also subset libraries
+# mm_currated_sets <- msigdbr(
+#   species = "Homo sapiens", # Replace with species name relevant to your data
+#   category = "H"
+# )
+```
+
+## 6. b) GSEA 
+```{r}
+ja_vec_sumb <- top_tables_list_filtered$Day_89_Good_vs_Bad %>%  
+  dplyr::select(Gene,logFC) %>% 
+  arrange(desc(logFC)) %>% 
+  #mutate(ENTREZID = mapIds(org.Hs.eg.db, keys = Gene, keytype="SYMBOL", column = "ENTREZID")) %>% 
+  pull(logFC,Gene)
+
+set.seed(123)
+out_gsea <- GSEA(
+  geneList = ja_vec_sumb, # Ordered ranked gene list
+  minGSSize = 5, # Minimum gene set size
+  maxGSSize = 5000, # Maximum gene set set
+  pvalueCutoff = 1, # p-value cutoff
+   pAdjustMethod = "BH", # Benjamini-Hochberg correction
+  eps = 0, # Boundary for calculating the p value
+  seed = TRUE, # Set seed to make results reproducible
+  TERM2GENE = dplyr::select(
+    all_gene_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+# This code gives overlapping genes from the leading gene set
+###############################################################
+genes_for_overlap <- out_gsea@result %>%   
+    filter(core_enrichment >= 10) %>% 
+ arrange(pvalue) %>% filter(pvalue <= 0.05) %>% filter(abs(NES) > 1.75) %>% 
+  pull(core_enrichment)
+
+combined_genes <- paste(genes_for_overlap, collapse = "/")
+split_gene_sets <- strsplit(combined_genes, "/")
+
+# Find the intersection (overlap) across all gene sets
+overlap_genes <- unique(Reduce(intersect, split_gene_sets))
+# Output the overlapping genes
+print(overlap_genes)
+###############################################################
+
+out_gsea@result$gene_number <- sapply(strsplit(out_gsea$core_enrichment, "/"), length)
+
+out_gsea@result %>%   
+    filter(core_enrichment >= 10) %>% 
+ arrange(pvalue) %>% filter(pvalue <= 0.05) %>% filter(abs(NES) > 1.75) %>% 
+  ggplot(aes(x = NES, y =  fct_reorder(ID, NES))) + #geom_col(aes(fill = DF_label)) + 
+  geom_segment(aes(yend=ID), xend=0, colour="grey50", linewidth=1, ) +
+  geom_point(aes(size = gene_number)) +
+  scale_color_brewer(palette = "Dark2") +
+    theme_bw() +
+   labs(title = "Top TNF-TNFR/NFkB Pathways at 4hr",
+              subtitle = "adj.p < 0.05")  + xlab("NES")+ ylab("GSEA PAthways") +
+  theme(
+    #plot.margin = margin(0.5, 0.5, 0.5, 0.5, unit = "cm"),
+    plot.title = element_text(size = 15, face = "bold"),
+    strip.text.y = element_text(angle = 0, face = "bold"),
+             strip.background =element_rect(fill="white", color = NA),
+    strip.placement = "outside",
+    axis.title.x = element_text(margin = margin(t = 0.5, b = 0.5, unit = "cm")),
+    axis.title.y = element_blank(),
+    axis.text = element_text(size = 10),
+    legend.position = "right",
+    panel.grid.major.y = element_blank())
+
+
+  # facet_grid(rows = vars(DF_label), scales = "free_y", #switch = "y", 
+  #            space = "free_y") +
+
+out_gsea@result %>%   
+    filter(core_enrichment >= 10) %>% 
+    arrange(pvalue) %>% 
+    filter(pvalue <= 0.05) %>% 
+    filter(abs(NES) > 1.75) %>% 
+    ggplot(aes(x = NES, y = fct_reorder(ID, NES))) + 
+    geom_segment(aes(yend = ID), xend = 0, colour = "grey50", linewidth = 1) +
+  xlim(-2,10)+
+    geom_point(aes(size = gene_number)) +
+    geom_text(aes(label = core_enrichment), hjust = 0, vjust = 0, size = 2) +
+    scale_color_brewer(palette = "Dark2") +
+    theme_bw()
+
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(grid)
+
+# Create the plot
+gsea_plot <- out_gsea@result %>%   
+    filter(core_enrichment >= 10) %>% 
+    arrange(pvalue) %>% 
+    filter(pvalue <= 0.05) %>% 
+    filter(abs(NES) > 1.75) %>% 
+    ggplot(aes(x = NES, y = fct_reorder(ID, NES))) + 
+    geom_segment(aes(yend = ID), xend = 0, colour = "grey50", linewidth = 1) +
+    geom_point(aes(size = gene_number)) +
+    scale_color_brewer(palette = "Dark2") +
+    theme_bw()
+
+# Create the table
+gsea_table <- out_gsea@result %>% 
+    filter(core_enrichment >= 10) %>% 
+    arrange(pvalue) %>% 
+    filter(pvalue <= 0.05) %>% 
+    filter(abs(NES) > 1.75) %>% 
+    dplyr::select(filtered_gene_sets) 
+
+# Create the table (we'll use the filtered_gene_sets and IDs from the filtered data)
+gsea_table <- filtered_data %>% 
+    dplyr::select(ID, filtered_gene_sets)
+
+# Convert the table to grob, with the row names (IDs) as the first column
+table_grob <- tableGrob(gsea_table, rows = NULL, theme = ttheme_minimal(
+  core = list(padding = unit(c(5, 5), "mm")),
+  colhead = list(padding = unit(c(5, 5), "mm"))
+))
+
+# Arrange the plot and the table side by side
+grid.arrange(gsea_plot, table_grob, ncol = 2, widths = c(2/3, 1/3))
+
+```
+# =====
+
+```{r}
+# Vector of genes to filter
+filter_genes <- unlist(split_gene_sets)
+
+# Define a function to filter each gene set
+filter_gene_set <- function(core_enrichment, filter_genes) {
+  # Split the gene set by "/"
+  genes <- unlist(strsplit(core_enrichment, "/"))
+  
+  # Filter only the genes present in the filter_genes vector
+  filtered_genes <- genes[!genes %in% filter_genes]
+  
+  # Combine back into a single string
+  paste(filtered_genes, collapse = "/")
+}
+
+# Apply the function to each row of gene sets
+out_gsea@result$filtered_gene_sets <- sapply(out_gsea@result$core_enrichment, filter_gene_set, 
+                                             filter_genes = filter_genes)
+
+# Output the updated data frame
+print(out_gsea@result$filtered_gene_sets)
+
+```
+
+```{r}
+ego_summary %>% arrange(pvalue)
+
+clust.tab %>% filter(Vac_cycle)
+
+abc_wide <- clust.tab %>%  dplyr::select(genes, Outcome,cluster, value) %>% 
+  pivot_wider(names_from = Outcome, values_from = value)
+abc_wide %<>% mutate(diff = Good - Bad) %>% 
+  mutate(up_down = if_else(diff < 0, "down", "up"))
+
+abc_wide %>% arrange(desc(diff)) %>% group_by(cluster) %>% count() %>% arrange(desc(n))
+abc_wide %>% arrange(desc(diff)) %>% group_by(cluster,up_down) %>% count() %>% filter(n > 25) %>% 
+  ggplot(aes(up_down, n)) +  geom_bar(stat = "identity", aes(fill = up_down)) +
+  facet_wrap(~cluster)
+
+
+
+
+abc <- clust.tab %>% filter(Vac_cycle == "day_43")
+names(clust.tab)
+
+abc %>% ggplot(aes(Outcome, value)) +
+  geom_point(aes(color = Outcome)) + 
+   geom_line(aes(group = genes),
+             color = "red", size = 0.1, alpha = 0.5)+
+       scale_color_manual(values = c(colors_LHB$Outcome)) +  facet_wrap(~cluster) 
+names(abc)
+abc_wide <- abc %>%  dplyr::select(genes, Outcome,cluster, value) %>% pivot_wider(names_from = Outcome, values_from = value)
+abc_wide %<>% mutate(diff = Good - Bad) %>% 
+  mutate(up_down = if_else(diff < 0, "down", "up"))
+
+abc_wide %>% arrange(desc(diff)) %>% group_by(cluster) %>% count() %>% arrange(desc(n))
+abc_wide %>% arrange(desc(diff)) %>% group_by(cluster,up_down) %>% count() %>% filter(n > 25) %>% 
+  ggplot(aes(up_down, n)) +  geom_bar(stat = "identity", aes(fill = up_down)) +
+  facet_wrap(~cluster)
+
+
+
+abc_wide %>% abc_wide %>% Good
+   gather(key = "Outcome", value = "Expression" , c(Bad, Good)) %>% 
+  janitor::tabyl(up_down,Outcome)
+
+
+abc_wide %>%
+  gather(key = "Outcome", value = "Expression" , c(Bad, Good)) %>%  
+  ggplot(aes(Outcome, Expression)) +
+  geom_point(aes(color = up_down)) + 
+   geom_line(aes(group = genes, color = up_down),
+              size = 0.1, alpha = 0.5)+
+       # scale_color_manual(values = c(colors_LHB$Outcome)) +  
+  facet_wrap(~cluster) 
+
+# Use the data yourself for custom figures
+ggplot(clust.tab,
+       aes(Vac_cycle, value, color = Outcome)) +
+  #geom_boxplot(outlier.shape = NA) +
+  #geom_point(position = position_jitterdodge(dodge.width = 0.9), size =0.1) +
+  geom_line(data = clust.tab %>% filter(Outcome == "Good"),
+            aes(group = genes),
+             color = "red", size = 0.1, alpha = 0.5) +  
+  geom_line(data = clust.tab %>% filter(Outcome == "Bad"),   aes(group = genes),
+            color = "grey45", size = 0.1, alpha = 0.5) +  
+  scale_color_manual(values = c(colors_LHB$Outcome)) +
+  # geom_line(stat = "summary", fun = "median", size = 1.5,
+  #           aes(group = Outcome)) +
+  scale_color_manual(values = c(colors_LHB$Outcome)) +
+  theme_bw() +
+  geom_smooth(aes(group=Outcome), method = "auto") + 
+  facet_wrap(~cluster) 
+```
+
+
