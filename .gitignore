@@ -30,3 +30,11 @@ results/tables/*
 # Large source data mistakenly placed anywhere
 *.csv.gz
 downloads_study310_*
+
+# Unpublished manuscript figure PDF (kept local, not published)
+figures pdf.pdf
+*.pdf
+
+# Figure-data build/harness scripts (kept local, not published)
+R/extract_reap_figure_data.R
+R/build_figure_source_data.R
